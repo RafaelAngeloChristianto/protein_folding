@@ -13,7 +13,7 @@ python -m compbio_fp
 Run with a sequence non-interactively and save animation (requires ffmpeg or ImageMagick):
 
 ```powershell
-python -m scripts.run_demo --sequence ACDEFG --steps 200 --no-plot --save-animation out/demo
+python -m compbio_fp --sequence ACDEFG --steps 200 --no-plot --save-animation out/demo
 ```
 
 Dependencies
