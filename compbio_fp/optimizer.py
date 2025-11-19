@@ -4,7 +4,7 @@ from .utils import rotation_matrix
 
 
 class SimulatedAnnealer:
-    def __init__(self, protein, energy_fn, temp_K=300.0, k_B=0.0019872041, cooling=0.995, max_steps=2000, step_size=0.4):
+    def __init__(self, protein, energy_fn, temp_K=300.0, k_B=0.0019872041, cooling=0.995, max_steps=2000, step_size=0.4, max_energy_jump=1e6, debug=False, energy_term_threshold=1e5):
         self.protein = protein
         self.energy_fn = energy_fn
         # store temperature in Kelvin and convert to energy units via k_B (kcal/mol·K)
@@ -15,6 +15,12 @@ class SimulatedAnnealer:
         self.max_steps = max_steps
         self.step_size = step_size
         self.history = []
+        # maximum allowed energy jump between consecutive accepted evaluations (treat larger jumps as invalid)
+        self.max_energy_jump = float(max_energy_jump)
+        # debug: print per-term energies when suspicious
+        self.debug = bool(debug)
+        # threshold for any single energy term magnitude to be considered suspicious
+        self.energy_term_threshold = float(energy_term_threshold)
 
     def propose_move(self):
         coords_old = self.protein.coords.copy()
@@ -79,6 +85,33 @@ class SimulatedAnnealer:
         coords = self.protein.coords.copy()
         energy_dict = self.energy_fn.total_energy()
         e = energy_dict['total']
+
+        # initial sanity check: print per-term energies if unphysical
+        def _check_and_report(ed, label="energy"):
+            if not isinstance(ed, dict):
+                if self.debug:
+                    print(f"[DEBUG] {label} not a dict: {ed}")
+                return False
+            bad = False
+            for k, v in ed.items():
+                try:
+                    val = float(v)
+                except Exception:
+                    val = float('nan')
+                if not np.isfinite(val) or abs(val) > self.energy_term_threshold:
+                    bad = True
+                    if self.debug:
+                        print(f"[DEBUG] Unphysical term: {k} = {v} (label={label})")
+            if bad and self.debug:
+                # print full per-term breakdown for debugging
+                print(f"[DEBUG] Full {label} breakdown:")
+                for k, v in ed.items():
+                    print(f"  {k}: {v}")
+            return not bad
+
+        # report initial if suspicious
+        _check_and_report(energy_dict, "initial_energy")
+
         best_coords = coords.copy()
         best_e = e
         self.history.append((coords.copy(), energy_dict))
@@ -108,13 +141,49 @@ class SimulatedAnnealer:
             self.protein.coords = coords_new
             energy_dict_new = self.energy_fn.total_energy()
             new_e = energy_dict_new['total']
+
+            # Check per-term energies and report if suspicious; treat as rejection if unphysical
+            physical = _check_and_report(energy_dict_new, label=f"step_{step}_proposed")
+            if not physical:
+                if self.debug:
+                    print(f"[DEBUG] Rejecting move at step {step} due to unphysical per-term energy.")
+                # Treat as rejection: restore previous coords and record previous energy (no spike)
+                self.protein.coords = coords.copy()
+                self.history.append((coords.copy(), energy_dict))
+                # cool/update and continue
+                self.temp_K *= self.cooling
+                self.T_energy = self.k_B * self.temp_K
+                if step % 500 == 0 and step > 0:
+                    self.step_size *= 0.9
+                if self.temp_K < 1e-6:
+                    break
+                continue
+
+            # Reject moves that produce non-finite energies or absurdly large energy jumps
+            if (not np.isfinite(new_e)) or (not np.isfinite(e)) or (abs(new_e - e) > self.max_energy_jump):
+                if self.debug:
+                    print(f"[DEBUG] Rejecting move at step {step} due to new_e={new_e}, old_e={e}, dE={new_e-e}")
+                # Treat as rejection: restore previous coords and record previous energy (no spike)
+                self.protein.coords = coords.copy()
+                self.history.append((coords.copy(), energy_dict))
+                # cool/update and continue
+                self.temp_K *= self.cooling
+                self.T_energy = self.k_B * self.temp_K
+                if step % 500 == 0 and step > 0:
+                    self.step_size *= 0.9
+                if self.temp_K < 1e-6:
+                    break
+                continue
+
             dE = new_e - e
             accept = False
             if dE < 0:
                 accept = True
             else:
+                # safe divide (T_energy guarded in denominator)
                 if np.random.rand() < math.exp(-dE / max(self.T_energy, 1e-12)):
                     accept = True
+
             if accept:
                 # check bond deviations (torsion moves should preserve bonds)
                 max_dev = max_bond_deviation(self.protein.coords, r0=self.protein.ca_distance)
@@ -125,12 +194,19 @@ class SimulatedAnnealer:
                 else:
                     coords = coords_new.copy()
                     e = new_e
+                    energy_dict = energy_dict_new
                     if e < best_e:
                         best_e = e
                         best_coords = coords.copy()
-            else:
+
+            if not accept:
+                # ensure coords and energy_dict reflect the preserved state, and avoid recording spike values
                 self.protein.coords = coords.copy()
-            self.history.append((coords.copy(), energy_dict_new))
+                self.history.append((coords.copy(), energy_dict))
+            else:
+                # record the accepted energy (no spike)
+                self.history.append((coords.copy(), energy_dict_new))
+
             # cool in Kelvin and update energy-scale temperature
             self.temp_K *= self.cooling
             self.T_energy = self.k_B * self.temp_K
