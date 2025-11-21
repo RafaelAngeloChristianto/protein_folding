@@ -4,7 +4,7 @@ from .utils import rotation_matrix
 
 
 class SimulatedAnnealer:
-    def __init__(self, protein, energy_fn, temp_K=300.0, k_B=0.0019872041, cooling=0.995, max_steps=2000, step_size=0.4, max_energy_jump=1e6, debug=False, energy_term_threshold=1e5):
+    def __init__(self, protein, energy_fn, temp_K=300.0, k_B=0.0019872041, cooling=0.995, max_steps=2000, step_size=0.4, max_energy_jump=1e6, debug=False, energy_term_threshold=1e5, gui_exit=True):
         self.protein = protein
         self.energy_fn = energy_fn
         # store temperature in Kelvin and convert to energy units via k_B (kcal/mol·K)
@@ -21,6 +21,8 @@ class SimulatedAnnealer:
         self.debug = bool(debug)
         # threshold for any single energy term magnitude to be considered suspicious
         self.energy_term_threshold = float(energy_term_threshold)
+        # If True, detect GUI window closes and exit the run loop
+        self.gui_exit = bool(gui_exit)
 
     def propose_move(self):
         coords_old = self.protein.coords.copy()
@@ -112,12 +114,42 @@ class SimulatedAnnealer:
         # report initial if suspicious
         _check_and_report(energy_dict, "initial_energy")
 
+        # attempt to detect matplotlib figures so we can exit when the user closes the visualizer
+        prev_fig_count = None
+        if self.gui_exit:
+            try:
+                import matplotlib.pyplot as plt
+                prev_fig_count = len(plt.get_fignums())
+            except Exception:
+                # matplotlib not available or import failed; ignore GUI detection
+                prev_fig_count = None
+
         best_coords = coords.copy()
         best_e = e
         self.history.append((coords.copy(), energy_dict))
         from .utils import max_bond_deviation
         BOND_TOL = 1e-6
         for step in range(self.max_steps):
+            # If GUI-exit detection is enabled, check for figure count decreasing
+            if prev_fig_count is not None:
+                try:
+                    import matplotlib.pyplot as plt
+                    curr_count = len(plt.get_fignums())
+                    if curr_count < prev_fig_count:
+                        if self.debug:
+                            print(f"[DEBUG] Detected figure close (prev={prev_fig_count}, curr={curr_count}) - exiting run loop")
+                        # close remaining figures and exit cleanly
+                        try:
+                            plt.close('all')
+                        except Exception:
+                            pass
+                        break
+                    # update previous count in case new figures were created
+                    prev_fig_count = curr_count
+                except Exception:
+                    # ignore matplotlib errors and continue
+                    prev_fig_count = None
+
             coords_new, coords_old = self.propose_move()
             # Quick geometric/bond constraint pre-check to avoid expensive energy
             # evaluations for moves that will be rejected because they violate
