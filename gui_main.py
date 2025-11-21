@@ -2,7 +2,7 @@
 """Comprehensive GUI for protein folding demo with embedded visualization"""
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, scrolledtext
 import threading
 import numpy as np
 import matplotlib.pyplot as plt
@@ -28,6 +28,7 @@ class ProteinFoldingGUI:
         self.history = []
         self.current_frame = 0
         self.animation_running = False
+        self.start_temp = None
         
         self.setup_ui()
         
@@ -67,21 +68,52 @@ class ProteinFoldingGUI:
         # Status
         ttk.Label(control_frame, textvariable=self.status_var, wraplength=150).pack(pady=10)
         
-        # Right panel - visualization
+        # Right panel - visualization + results (tabs)
         viz_frame = ttk.LabelFrame(main_frame, text="Visualization")
         viz_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        
-        # Create matplotlib figure
-        self.fig = Figure(figsize=(10, 8))
-        self.ax3d = self.fig.add_subplot(221, projection='3d')
-        self.ax_energy = self.fig.add_subplot(222)
-        self.ax_rmsd = self.fig.add_subplot(223)
-        self.ax_temp = self.fig.add_subplot(224)
-        
-        self.canvas = FigureCanvasTkAgg(self.fig, viz_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        self.fig.tight_layout()
+
+        # Notebook with three tabs: Structure, Graphs and Results
+        self.notebook = ttk.Notebook(viz_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.structure_tab = ttk.Frame(self.notebook)
+        self.graphs_tab = ttk.Frame(self.notebook)
+        self.results_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.structure_tab, text="Structure")
+        self.notebook.add(self.graphs_tab, text="Graphs")
+        self.notebook.add(self.results_tab, text="Results")
+
+        # Create matplotlib figure for the 3D final structure (placed in Structure tab)
+        self.fig_structure = Figure(figsize=(6, 6))
+        self.ax3d = self.fig_structure.add_subplot(111, projection='3d')
+        self.canvas_structure = FigureCanvasTkAgg(self.fig_structure, self.structure_tab)
+        self.canvas_structure.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Create matplotlib figure for the three graphs (placed in Graphs tab)
+        # Use a 2x2 grid and place plots at: (1,1)=energy, (1,2)=rmsd, (2,1)=temp
+        # leave (2,2) empty
+        self.fig_graphs = Figure(figsize=(8, 8))
+        self.ax_energy = self.fig_graphs.add_subplot(2, 2, 1)
+        self.ax_rmsd = self.fig_graphs.add_subplot(2, 2, 2)
+        self.ax_temp = self.fig_graphs.add_subplot(2, 2, 3)
+        # (2,2) intentionally left empty
+        self.canvas_graphs = FigureCanvasTkAgg(self.fig_graphs, self.graphs_tab)
+        self.canvas_graphs.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Attempt to make each axes square-shaped where supported
+        for _ax in (self.ax_energy, self.ax_rmsd, self.ax_temp):
+            try:
+                _ax.set_box_aspect(1)
+            except Exception:
+                # Older matplotlib may not support set_box_aspect; ignore
+                pass
+
+        # Results tab: scrolled text for numeric output
+        self.results_text = scrolledtext.ScrolledText(self.results_tab, wrap=tk.WORD, height=20)
+        self.results_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.fig_structure.tight_layout()
+        self.fig_graphs.tight_layout()
         
     def run_simulation(self):
         sequence = self.sequence_var.get().strip().upper()
@@ -91,6 +123,8 @@ class ProteinFoldingGUI:
         except ValueError:
             self.status_var.set("Error: Invalid numeric values")
             return
+        # record the starting temperature chosen by the user for verification
+        self.start_temp = temp
             
         self.run_btn.config(state='disabled')
         self.animate_btn.config(state='disabled')
@@ -105,9 +139,24 @@ class ProteinFoldingGUI:
         try:
             protein = Protein(sequence)
             energy_fn = EnergyFunction(protein)
+            # debug: print the temperature being used to construct the optimizer
+            print(f"[DEBUG] Starting temperature (K) passed to optimizer: {temp}")
             optimizer = SimulatedAnnealer(protein, energy_fn, temp_K=temp, max_steps=steps)
+            # capture initial energy-scale temperature (kcal/mol units) for display
+            try:
+                self.start_T_energy = optimizer.T_energy
+            except Exception:
+                self.start_T_energy = None
+            # capture cooling rate so we can mirror the temperature decay in the plot
+            try:
+                self.start_cooling = optimizer.cooling
+            except Exception:
+                self.start_cooling = 0.995
             
             best_coords, best_e, self.history = optimizer.run()
+            # store best results for later display
+            self.best_coords = best_coords
+            self.best_energy = best_e
             self.root.after(0, self._simulation_complete)
             
         except Exception as e:
@@ -120,47 +169,75 @@ class ProteinFoldingGUI:
         self.run_btn.config(state='normal')
         self.animate_btn.config(state='normal')
         self.plot_results()
+        # populate the Results tab with numeric outputs
+        try:
+            self.update_results_text()
+        except Exception:
+            pass
         
     def plot_results(self):
         if not self.history:
             return
-            
-        # Clear axes
-        self.ax3d.clear()
-        self.ax_energy.clear()
-        self.ax_rmsd.clear()
-        self.ax_temp.clear()
-        
-        # Plot final structure
-        final_coords = self.history[-1][0]
-        self.ax3d.plot(final_coords[:,0], final_coords[:,1], final_coords[:,2], 'b-', linewidth=2)
-        self.ax3d.scatter(final_coords[:,0], final_coords[:,1], final_coords[:,2], c='red', s=50)
-        self.ax3d.set_title('Final Structure')
-        
-        # Plot energy evolution
-        energies = [h[1]['total'] for h in self.history]
-        self.ax_energy.plot(energies)
-        self.ax_energy.set_title('Energy vs Step')
-        self.ax_energy.set_ylabel('Energy')
-        
-        # Plot RMSD from initial
-        initial_coords = self.history[0][0]
-        rmsds = []
-        for coords, _ in self.history:
-            diff = coords - initial_coords
+        # Plot final structure in its own tab
+        self.plot_structure(self.history[-1][0], self.history[-1][1].get('total') if isinstance(self.history[-1][1], dict) else None)
+
+        # Plot graphs (energy, RMSD, temperature) in the Graphs tab
+        self.plot_graphs()
+
+    def update_results_text(self):
+        """Populate the Results tab with numeric summaries."""
+        if not self.history:
+            self.results_text.delete('1.0', tk.END)
+            self.results_text.insert(tk.END, "No results available.\n")
+            return
+
+        # initial energy and breakdown
+        initial_energy = self.history[0][1].get('total') if isinstance(self.history[0][1], dict) else None
+        energy_breakdown = self.history[0][1] if isinstance(self.history[0][1], dict) else {}
+
+        # best energy found
+        best_energy = getattr(self, 'best_energy', None)
+        if best_energy is None:
+            energies = [h[1].get('total') for h in self.history if isinstance(h[1], dict)]
+            best_energy = min(energies) if energies else None
+
+        # RMSD to initial structure (use best_coords if available, otherwise final)
+        try:
+            initial_coords = self.history[0][0]
+            target_coords = getattr(self, 'best_coords', self.history[-1][0])
+            diff = target_coords - initial_coords
             rmsd = np.sqrt(np.mean(np.sum(diff**2, axis=1)))
-            rmsds.append(rmsd)
-        self.ax_rmsd.plot(rmsds)
-        self.ax_rmsd.set_title('RMSD from Initial')
-        self.ax_rmsd.set_ylabel('RMSD (Å)')
-        
-        # Plot temperature (mock)
-        temps = [300 * (0.995 ** i) for i in range(len(self.history))]
-        self.ax_temp.plot(temps)
-        self.ax_temp.set_title('Temperature')
-        self.ax_temp.set_ylabel('Temperature (K)')
-        
-        self.canvas.draw()
+        except Exception:
+            rmsd = None
+
+        # Build text
+        lines = []
+        # include starting temperature used
+        if getattr(self, 'start_temp', None) is not None:
+            lines.append(f"Starting temperature (K): {self.start_temp}\n")
+        if getattr(self, 'start_T_energy', None) is not None:
+            lines.append(f"Starting temperature (energy units, k_BT): {self.start_T_energy}\n")
+
+        if initial_energy is not None:
+            lines.append(f"Initial energy: {initial_energy}\n")
+        else:
+            lines.append("Initial energy: N/A\n")
+
+        lines.append(f"Energy breakdown: {energy_breakdown}\n")
+
+        if best_energy is not None:
+            lines.append(f"Best energy found: {best_energy}\n")
+        else:
+            lines.append("Best energy found: N/A\n")
+
+        if rmsd is not None:
+            lines.append(f"RMSD to initial structure: {rmsd}\n")
+        else:
+            lines.append("RMSD to initial structure: N/A\n")
+
+        # Insert into scrolled text
+        self.results_text.delete('1.0', tk.END)
+        self.results_text.insert(tk.END, "\n".join(lines))
         
     def toggle_animation(self):
         if not self.animation_running:
@@ -174,20 +251,90 @@ class ProteinFoldingGUI:
     def animate_structure(self):
         if not self.animation_running or not self.history:
             return
-            
         coords = self.history[self.current_frame][0]
-        energy = self.history[self.current_frame][1]['total']
-        
+        energy = self.history[self.current_frame][1].get('total') if isinstance(self.history[self.current_frame][1], dict) else None
+
         self.ax3d.clear()
         self.ax3d.plot(coords[:,0], coords[:,1], coords[:,2], 'b-', linewidth=2)
         self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c='red', s=50)
-        self.ax3d.set_title(f'Step {self.current_frame}, Energy: {energy:.2f}')
-        
-        self.canvas.draw()
-        
+        title = f'Step {self.current_frame}'
+        if energy is not None:
+            title += f', Energy: {energy:.2f}'
+        self.ax3d.set_title(title)
+
+        self.canvas_structure.draw()
+
         self.current_frame = (self.current_frame + 1) % len(self.history)
         if self.animation_running:
             self.root.after(50, self.animate_structure)
+
+    def plot_structure(self, coords, energy=None):
+        """Draw the 3D final structure into the Structure tab."""
+        try:
+            self.ax3d.clear()
+            self.ax3d.plot(coords[:,0], coords[:,1], coords[:,2], 'b-', linewidth=2)
+            self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c='red', s=50)
+            title = 'Final Structure'
+            if energy is not None:
+                title += f' (Energy: {energy:.2f})'
+            self.ax3d.set_title(title)
+            self.canvas_structure.draw()
+        except Exception:
+            pass
+
+    def plot_graphs(self):
+        """Plot the energy, RMSD, and temperature graphs into the Graphs tab."""
+        try:
+            # Clear graph axes
+            self.ax_energy.clear()
+            self.ax_rmsd.clear()
+            self.ax_temp.clear()
+
+            # Energy evolution (plot vs step index)
+            steps = np.arange(len(self.history))
+            energies = [h[1]['total'] for h in self.history if isinstance(h[1], dict) and 'total' in h[1]]
+            if energies:
+                self.ax_energy.plot(steps, energies)
+            self.ax_energy.set_title('Energy vs Step')
+            self.ax_energy.set_ylabel('Energy')
+            self.ax_energy.set_xlim(0, max(1, len(self.history)-1))
+
+            # RMSD from initial
+            initial_coords = self.history[0][0]
+            rmsds = []
+            for coords, _ in self.history:
+                diff = coords - initial_coords
+                rmsd = np.sqrt(np.mean(np.sum(diff**2, axis=1)))
+                rmsds.append(rmsd)
+            self.ax_rmsd.plot(steps, rmsds)
+            self.ax_rmsd.set_title('RMSD from Initial')
+            self.ax_rmsd.set_ylabel('RMSD (Å)')
+            self.ax_rmsd.set_xlim(0, max(1, len(self.history)-1))
+
+            # Temperature (mock)
+            # compute temperature decay using the starting temperature entered by the user
+            start_temp = getattr(self, 'start_temp', None)
+            if start_temp is None:
+                start_temp = 300.0
+            cooling = getattr(self, 'start_cooling', 0.995)
+            temps = [start_temp * (cooling ** i) for i in range(len(self.history))]
+            # plot temperature vs step index and set limits so axis isn't wrongly capped
+            self.ax_temp.plot(steps, temps)
+            self.ax_temp.set_title('Temperature')
+            self.ax_temp.set_xlabel('Step')
+            self.ax_temp.set_ylabel('Temperature (K)')
+            # set sensible limits with a small margin
+            if temps:
+                tmin = min(temps)
+                tmax = max(temps)
+                margin = (tmax - tmin) * 0.05 if tmax != tmin else tmax * 0.05
+                self.ax_temp.set_ylim(tmin - margin, tmax + margin)
+            self.ax_temp.set_xlim(0, max(1, len(self.history)-1))
+
+            self.fig_graphs.tight_layout()
+            self.canvas_graphs.draw()
+        except Exception:
+            pass
     
     def run(self):
         self.root.mainloop()
