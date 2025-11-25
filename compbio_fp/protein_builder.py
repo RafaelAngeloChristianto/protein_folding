@@ -115,11 +115,6 @@ def place_rotamer(CA, CB, chi_deg):
                      np.sin(chi) * np.cross(v, perp))
     return sc
 
-
-############################################################
-# MINIMAL ROTAMER LIBRARY
-############################################################
-
 ROT_LIB = {
     "ARG": [60, -60, 180],
     "LYS": [60, -60, 180],
@@ -133,11 +128,6 @@ ROT_LIB = {
     "TRP": [60, -60, 180],
     "MET": [60, -60, 180],
 }
-
-
-############################################################
-# SCORING FUNCTION
-############################################################
 
 def steric_score(points):
     """
@@ -153,11 +143,6 @@ def steric_score(points):
             if d < 2.0:
                 total += np.exp(-(d - 2.0)**2)
     return total
-
-
-############################################################
-# ROTAMER PACKING
-############################################################
 
 def pack_sidechains(seq, N, CA, C):
     CB = []
@@ -187,11 +172,6 @@ def pack_sidechains(seq, N, CA, C):
 
     return np.array(CB), np.array(SC)
 
-
-############################################################
-# PDB OUTPUT
-############################################################
-
 def write_pdb(filename, N, CA, C, O, CB, SC):
     with open(filename, "w") as f:
         atom_id = 1
@@ -211,11 +191,6 @@ def write_pdb(filename, N, CA, C, O, CB, SC):
                     f"{coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}  1.00  0.00\n"
                 )
                 atom_id += 1
-
-
-############################################################
-# DEMO: 10-residue alpha helix (poly-Ala)
-############################################################
 
 def demo():
     # use 80-residue poly-Ala sequence

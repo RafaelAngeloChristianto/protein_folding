@@ -4,6 +4,8 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import threading
+import subprocess
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -11,6 +13,7 @@ from matplotlib.figure import Figure
 from compbio_fp.models import Protein
 from compbio_fp.energy import EnergyFunction
 from compbio_fp.optimizer import SimulatedAnnealer
+from compbio_fp.protein_builder import build_backbone_from_CA, pack_sidechains, write_pdb
 
 class ProteinFoldingGUI:
     def __init__(self):
@@ -59,6 +62,16 @@ class ProteinFoldingGUI:
         
         self.animate_btn = ttk.Button(control_frame, text="Animate", command=self.toggle_animation, state='disabled')
         self.animate_btn.pack(pady=5)
+        # View in PyMOL button
+        self.pymol_btn = ttk.Button(control_frame, text="View in PyMOL", command=self.view_in_pymol, state='disabled')
+        self.pymol_btn.pack(pady=5)
+        # Hydrophobicity display mode
+        ttk.Label(control_frame, text="Hydrophobicity view:").pack(anchor=tk.W, pady=(10,0))
+        self.hydro_mode_var = tk.StringVar(value='Continuous')
+        ttk.Combobox(control_frame, textvariable=self.hydro_mode_var, values=['Continuous', 'Binary'], state='readonly', width=12).pack(pady=(0,5))
+        ttk.Label(control_frame, text="Binary threshold (0-1):").pack(anchor=tk.W)
+        self.hydro_thresh_var = tk.DoubleVar(value=0.5)
+        ttk.Entry(control_frame, textvariable=self.hydro_thresh_var, width=6).pack(pady=(0,10))
         
         # Progress
         ttk.Label(control_frame, text="Progress:").pack(anchor=tk.W, pady=(20,0))
@@ -138,6 +151,11 @@ class ProteinFoldingGUI:
     def _run_simulation(self, sequence, steps, temp):
         try:
             protein = Protein(sequence)
+            # store hydrophobicity values (0..1) for coloring
+            try:
+                self.protein_hydro = [p['hydro'] for p in protein.props]
+            except Exception:
+                self.protein_hydro = None
             energy_fn = EnergyFunction(protein)
             # debug: print the temperature being used to construct the optimizer
             print(f"[DEBUG] Starting temperature (K) passed to optimizer: {temp}")
@@ -168,6 +186,7 @@ class ProteinFoldingGUI:
         self.progress_var.set(100)
         self.run_btn.config(state='normal')
         self.animate_btn.config(state='normal')
+        self.pymol_btn.config(state='normal')
         self.plot_results()
         # populate the Results tab with numeric outputs
         try:
@@ -253,10 +272,27 @@ class ProteinFoldingGUI:
             return
         coords = self.history[self.current_frame][0]
         energy = self.history[self.current_frame][1].get('total') if isinstance(self.history[self.current_frame][1], dict) else None
-
         self.ax3d.clear()
-        self.ax3d.plot(coords[:,0], coords[:,1], coords[:,2], 'b-', linewidth=2)
-        self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c='red', s=50)
+        # draw backbone line in neutral color
+        self.ax3d.plot(coords[:,0], coords[:,1], coords[:,2], color='gray', linewidth=1)
+
+        # color CA points by hydrophobicity if available
+        hydro = getattr(self, 'protein_hydro', None)
+        mode = self.hydro_mode_var.get() if hasattr(self, 'hydro_mode_var') else 'Continuous'
+        if hydro is None:
+            self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c='red', s=50)
+        else:
+            if mode == 'Continuous':
+                import matplotlib.cm as cm
+                import matplotlib.colors as mcolors
+                cmap = cm.get_cmap('coolwarm')
+                norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+                colors = [cmap(norm(h)) for h in hydro]
+                self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c=colors, s=50)
+            else:
+                thresh = float(self.hydro_thresh_var.get()) if hasattr(self, 'hydro_thresh_var') else 0.5
+                cols = ['orange' if h > thresh else 'cyan' for h in hydro]
+                self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c=cols, s=50)
         title = f'Step {self.current_frame}'
         if energy is not None:
             title += f', Energy: {energy:.2f}'
@@ -272,8 +308,41 @@ class ProteinFoldingGUI:
         """Draw the 3D final structure into the Structure tab."""
         try:
             self.ax3d.clear()
-            self.ax3d.plot(coords[:,0], coords[:,1], coords[:,2], 'b-', linewidth=2)
-            self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c='red', s=50)
+            # draw backbone line in neutral color
+            self.ax3d.plot(coords[:,0], coords[:,1], coords[:,2], color='gray', linewidth=1)
+
+            # color CA points by hydrophobicity if available
+            hydro = getattr(self, 'protein_hydro', None)
+            mode = self.hydro_mode_var.get() if hasattr(self, 'hydro_mode_var') else 'Continuous'
+            if hydro is None:
+                self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c='red', s=50)
+            else:
+                if mode == 'Continuous':
+                    import matplotlib.cm as cm
+                    import matplotlib.colors as mcolors
+                    cmap = cm.get_cmap('coolwarm')
+                    norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+                    sc = self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c=hydro, cmap=cmap, norm=norm, s=60)
+                    # add colorbar to the structure figure
+                    try:
+                        mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
+                        mappable.set_array(hydro)
+                        cb = self.fig_structure.colorbar(mappable, ax=self.ax3d, shrink=0.6, pad=0.05)
+                        cb.set_label('Hydrophobicity (0..1)')
+                    except Exception:
+                        pass
+                else:
+                    thresh = float(self.hydro_thresh_var.get()) if hasattr(self, 'hydro_thresh_var') else 0.5
+                    cols = ['orange' if h > thresh else 'cyan' for h in hydro]
+                    self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c=cols, s=60)
+                    # legend
+                    from matplotlib.patches import Patch
+                    legend_patches = [Patch(color='orange', label='Hydrophobic'), Patch(color='cyan', label='Hydrophilic')]
+                    try:
+                        self.ax3d.legend(handles=legend_patches)
+                    except Exception:
+                        pass
+
             title = 'Final Structure'
             if energy is not None:
                 title += f' (Energy: {energy:.2f})'
@@ -335,6 +404,55 @@ class ProteinFoldingGUI:
             self.canvas_graphs.draw()
         except Exception:
             pass
+
+    def _sequence_one_to_three(self, seq_one):
+        """Convert a single-letter sequence string to a list of three-letter codes.
+
+        Unknown residues are mapped to 'ALA' as a safe fallback.
+        """
+        mapping = {
+            'A': 'ALA', 'R': 'ARG', 'N': 'ASN', 'D': 'ASP', 'C': 'CYS',
+            'E': 'GLU', 'Q': 'GLN', 'G': 'GLY', 'H': 'HIS', 'I': 'ILE',
+            'L': 'LEU', 'K': 'LYS', 'M': 'MET', 'F': 'PHE', 'P': 'PRO',
+            'S': 'SER', 'T': 'THR', 'W': 'TRP', 'Y': 'TYR', 'V': 'VAL'
+        }
+        seq_one = seq_one.strip().upper()
+        return [mapping.get(ch, 'ALA') for ch in seq_one]
+
+    def view_in_pymol(self):
+        """Write the current best/final structure to a PDB and open it in an external PyMOL process.
+
+        Uses `write_pdb` from `protein_builder.py` to write a reasonable PDB built from the CA trace.
+        """
+        # choose coordinates: prefer best_coords, else last history frame
+        if getattr(self, 'best_coords', None) is not None:
+            ca_coords = self.best_coords
+        elif self.history:
+            ca_coords = self.history[-1][0]
+        else:
+            self.status_var.set("No structure available to view")
+            return
+
+        try:
+            # Build backbone and sidechains
+            N_arr, CA_arr, C_arr, O_arr = build_backbone_from_CA(np.asarray(ca_coords))
+            seq_three = self._sequence_one_to_three(self.sequence_var.get())
+            CB_arr, SC_arr = pack_sidechains(seq_three, N_arr, CA_arr, C_arr)
+
+            # write PDB to repo root with a timestamp
+            out_name = f"sim_result_{int(threading.get_ident())}.pdb"
+            out_path = os.path.join(os.getcwd(), out_name)
+            write_pdb(out_path, N_arr, CA_arr, C_arr, O_arr, CB_arr, SC_arr)
+
+            # launch external PyMOL
+            try:
+                pymol_cmd = os.environ.get('PYMOL_PATH', 'pymol')
+                subprocess.Popen([pymol_cmd, out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.status_var.set(f"Opened structure in PyMOL: {out_name}")
+            except FileNotFoundError:
+                self.status_var.set("PyMOL not found. Install PyMOL, add to PATH, or set PYMOL_PATH environment variable to the full executable path.")
+        except Exception as e:
+            self.status_var.set(f"Error preparing structure for PyMOL: {e}")
     
     def run(self):
         self.root.mainloop()
