@@ -32,6 +32,9 @@ class ProteinFoldingGUI:
         self.current_frame = 0
         self.animation_running = False
         self.start_temp = None
+        # references to colorbar/legend so we can remove them between redraws
+        self.hydro_colorbar = None
+        self.hydro_legend = None
         
         self.setup_ui()
         
@@ -68,10 +71,8 @@ class ProteinFoldingGUI:
         # Hydrophobicity display mode
         ttk.Label(control_frame, text="Hydrophobicity view:").pack(anchor=tk.W, pady=(10,0))
         self.hydro_mode_var = tk.StringVar(value='Continuous')
-        ttk.Combobox(control_frame, textvariable=self.hydro_mode_var, values=['Continuous', 'Binary'], state='readonly', width=12).pack(pady=(0,5))
-        ttk.Label(control_frame, text="Binary threshold (0-1):").pack(anchor=tk.W)
-        self.hydro_thresh_var = tk.DoubleVar(value=0.5)
-        ttk.Entry(control_frame, textvariable=self.hydro_thresh_var, width=6).pack(pady=(0,10))
+        ttk.Combobox(control_frame, textvariable=self.hydro_mode_var, values=['Continuous'], state='readonly', width=12).pack(pady=(0,5))
+
         
         # Progress
         ttk.Label(control_frame, text="Progress:").pack(anchor=tk.W, pady=(20,0))
@@ -320,26 +321,55 @@ class ProteinFoldingGUI:
                 if mode == 'Continuous':
                     import matplotlib.cm as cm
                     import matplotlib.colors as mcolors
+
                     cmap = cm.get_cmap('coolwarm')
                     norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
                     sc = self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c=hydro, cmap=cmap, norm=norm, s=60)
-                    # add colorbar to the structure figure
+                    # Don't use make_axes_locatable with a 3D axes (it can create
+                    # axes that interfere with mplot3d rendering). Instead create
+                    # a small standalone axes in figure coordinates and reuse it.
                     try:
+                        pos = self.ax3d.get_position()
+                        fig = self.fig_structure
+                        cax_width = 0.025
+                        pad = 0.01
+                        cax_x = pos.x1 + pad
+                        cax_y = pos.y0
+                        cax_h = pos.height
+                        cax_rect = [cax_x, cax_y, cax_width, cax_h]
+
+                        # create or reposition reusable colorbar axes
+                        if getattr(self, 'hydro_cax', None) is None or self.hydro_cax not in fig.axes:
+                            self.hydro_cax = fig.add_axes(cax_rect)
+                        else:
+                            try:
+                                self.hydro_cax.set_position(cax_rect)
+                                self.hydro_cax.cla()
+                            except Exception:
+                                pass
+
                         mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
                         mappable.set_array(hydro)
-                        cb = self.fig_structure.colorbar(mappable, ax=self.ax3d, shrink=0.6, pad=0.05)
+                        cb = fig.colorbar(mappable, cax=self.hydro_cax)
                         cb.set_label('Hydrophobicity (0..1)')
+                        self.hydro_colorbar = cb
                     except Exception:
                         pass
                 else:
                     thresh = float(self.hydro_thresh_var.get()) if hasattr(self, 'hydro_thresh_var') else 0.5
                     cols = ['orange' if h > thresh else 'cyan' for h in hydro]
                     self.ax3d.scatter(coords[:,0], coords[:,1], coords[:,2], c=cols, s=60)
-                    # legend
+                    # legend: remove previous then add
                     from matplotlib.patches import Patch
                     legend_patches = [Patch(color='orange', label='Hydrophobic'), Patch(color='cyan', label='Hydrophilic')]
                     try:
-                        self.ax3d.legend(handles=legend_patches)
+                        if getattr(self, 'hydro_legend', None) is not None:
+                            try:
+                                self.hydro_legend.remove()
+                            except Exception:
+                                pass
+                            self.hydro_legend = None
+                        self.hydro_legend = self.ax3d.legend(handles=legend_patches)
                     except Exception:
                         pass
 

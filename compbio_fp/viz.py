@@ -92,7 +92,6 @@ def animate_history(history, sequence, save_as=None, show=True):
         except Exception as e_pillow:
             errors.append(('pillow', e_pillow))
 
-        # 3) ImageMagick -> gif (string writer)
         try:
             out_path = base_name if base_name.lower().endswith('.gif') else base_name + '.gif'
             animation_obj.save(out_path, writer='imagemagick', fps=30)
@@ -105,7 +104,6 @@ def animate_history(history, sequence, save_as=None, show=True):
         except Exception as e_im:
             errors.append(('imagemagick', e_im))
 
-        # Nothing worked; report errors and try final PNG snapshot if coords available
         logging.warning("Failed to save animation with available writers.")
         for name, ex in errors:
             logging.warning("%s error: %s", name, ex)
