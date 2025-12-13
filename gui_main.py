@@ -15,6 +15,7 @@ from compbio_fp.models import Protein
 from compbio_fp.energy import EnergyFunction
 from compbio_fp.optimizer import SimulatedAnnealer, ReplicaExchange
 from compbio_fp.protein_builder import build_backbone_from_CA, pack_sidechains, write_pdb
+from compbio_fp.fasta_db import load_database_sequences
 
 class ProteinFoldingGUI:
     def __init__(self):
@@ -28,6 +29,10 @@ class ProteinFoldingGUI:
         self.temp_var = tk.StringVar(value="300")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar()
+        self.db_sequence_var = tk.StringVar()
+        
+        # Load database sequences
+        self.db_sequences = load_database_sequences()
         
         self.history = []
         self.current_frame = 0
@@ -50,9 +55,18 @@ class ProteinFoldingGUI:
         control_frame = ttk.LabelFrame(main_frame, text="Controls", padding="10")
         control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0,10))
         
-        # Sequence
+        # Database sequence selection
+        ttk.Label(control_frame, text="Database Sequences:").pack(anchor=tk.W)
+        db_options = ["Custom"] + [f"{header[:50]}..." if len(header) > 50 else header for header in self.db_sequences.keys()]
+        self.db_combo = ttk.Combobox(control_frame, textvariable=self.db_sequence_var, values=db_options, state='readonly', width=25)
+        self.db_combo.set("Custom")
+        self.db_combo.pack(pady=(0,5))
+        self.db_combo.bind('<<ComboboxSelected>>', self.on_db_sequence_selected)
+        
+        # Manual sequence entry
         ttk.Label(control_frame, text="Sequence:").pack(anchor=tk.W)
-        ttk.Entry(control_frame, textvariable=self.sequence_var, width=20).pack(pady=(0,10))
+        self.sequence_entry = ttk.Entry(control_frame, textvariable=self.sequence_var, width=20)
+        self.sequence_entry.pack(pady=(0,10))
         
         # Steps
         ttk.Label(control_frame, text="Steps:").pack(anchor=tk.W)
@@ -175,6 +189,21 @@ class ProteinFoldingGUI:
         self.fig_graphs.tight_layout()
         # Ensure optimizer UI initial state
         self._on_optimizer_change()
+    
+    def on_db_sequence_selected(self, event=None):
+        """Handle database sequence selection"""
+        selected = self.db_sequence_var.get()
+        if selected == "Custom":
+            self.sequence_entry.config(state='normal')
+            return
+        
+        # Find the full header that matches the truncated display
+        for header, sequence in self.db_sequences.items():
+            display_header = f"{header[:50]}..." if len(header) > 50 else header
+            if display_header == selected:
+                self.sequence_var.set(sequence)
+                self.sequence_entry.config(state='readonly')
+                break
 
     def _on_optimizer_change(self):
         """Show/hide optimizer-specific parameter controls."""
