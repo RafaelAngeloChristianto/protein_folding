@@ -1,10 +1,322 @@
 import numpy as np
 import math
 from .utils import rotation_matrix
+from multiprocessing import Pool, cpu_count
+import os
+
+
+# Module-level worker function for parallel replica evaluation (must be picklable)
+def _evaluate_replica_worker(args):
+    """Worker function to propose and evaluate a move for one replica.
+    
+    Args:
+        args: tuple of (replica_dict, step_size, ca_distance, BOND_TOL, k_B)
+    Returns:
+        updated replica_dict with new coords and energy_dict
+    """
+    replica_dict, step_size, ca_distance, BOND_TOL, k_B = args
+    from .utils import max_bond_deviation, rotation_matrix
+    
+    # Extract current state
+    coords_old = replica_dict['coords'].copy()
+    coords_new = coords_old.copy()
+    N = coords_old.shape[0]
+    
+    # Propose move (local copy of propose logic)
+    if N > 2:
+        r = np.random.rand()
+        if r < 0.7:
+            b = np.random.randint(0, N - 1)
+            p1 = coords_old[b]
+            p2 = coords_old[b+1]
+            axis = p2 - p1
+            axis_len = np.linalg.norm(axis)
+            if axis_len > 0:
+                axis = axis / axis_len
+                angle = np.random.normal(scale=step_size)
+                R = rotation_matrix(axis, angle)
+                idx = np.arange(b+1, N)
+                if idx.size > 0:
+                    rel = coords_old[idx] - p1
+                    rotated = (R @ rel.T).T + p1
+                    coords_new[idx] = rotated
+        elif r < 0.9:
+            pivot = np.random.randint(0, N - 1)
+            angle = np.random.normal(scale=2.0*step_size)
+            axis = np.random.normal(size=3)
+            norm = np.linalg.norm(axis)
+            if norm > 0:
+                axis = axis / norm
+                R = rotation_matrix(axis, angle)
+                pivot_point = coords_old[pivot]
+                idx = np.arange(pivot + 1, N)
+                if idx.size > 0:
+                    rel = coords_old[idx] - pivot_point
+                    rotated = (R @ rel.T).T + pivot_point
+                    coords_new[idx] = rotated
+        else:
+            i = np.random.randint(1, N - 1)
+            displacement = np.random.normal(scale=step_size, size=3)
+            coords_new[i] += displacement
+            if i - 1 >= 0:
+                coords_new[i-1] += 0.2 * displacement
+            if i + 1 < N:
+                coords_new[i+1] += 0.2 * displacement
+    
+    # Bond check
+    max_dev = max_bond_deviation(coords_new, r0=ca_distance)
+    if max_dev > BOND_TOL:
+        # Reject - return unchanged
+        return replica_dict
+    
+    # Evaluate energy
+    from .models import Protein
+    prot = Protein.__new__(Protein)
+    prot.__dict__.update(replica_dict['protein_dict'])
+    prot.coords = coords_new
+    prot.ca_distance = ca_distance
+    ef = replica_dict['energy_fn_class'](prot)
+    energy_dict_new = ef.total_energy()
+    new_e = energy_dict_new['total']
+    old_e = replica_dict['energy_dict']['total']
+    
+    # Acceptance
+    if not np.isfinite(new_e) or not np.isfinite(old_e):
+        return replica_dict
+    
+    if new_e < old_e:
+        accept = True
+    else:
+        T_energy = k_B * replica_dict['temp_K']
+        if np.random.rand() < math.exp(-(new_e - old_e) / max(T_energy, 1e-12)):
+            accept = True
+        else:
+            accept = False
+    
+    if accept:
+        replica_dict['coords'] = coords_new.copy()
+        replica_dict['energy_dict'] = energy_dict_new
+    
+    return replica_dict
+
+
+class ReplicaExchange:
+    """A minimal Parallel Tempering / Replica Exchange Monte Carlo implementation.
+
+    This runs `num_replicas` Monte-Carlo replicas at different fixed temperatures
+    and attempts swaps between neighboring replicas every `exchange_interval`
+    steps. The implementation is intentionally simple and reuses the same
+    propose-move style used by SimulatedAnnealer.
+    """
+    def __init__(self, protein, energy_fn, num_replicas=4, exchange_interval=10, base_temp_K=300.0,
+                 temp_scale=1.5, k_B=0.0019872041, max_steps=2000, step_size=0.4, debug=False, n_workers=None):
+        import copy
+        from .utils import max_bond_deviation
+
+        self.copy = copy
+        self.max_bond_deviation = max_bond_deviation
+        self.energy_fn_class = energy_fn.__class__
+        # create independent replicas (deep copies of the protein and independent energy_fns)
+        self.replicas = []
+        self.num_replicas = int(max(2, num_replicas))
+        self.exchange_interval = int(max(1, exchange_interval))
+        self.k_B = float(k_B)
+        self.max_steps = int(max_steps)
+        self.step_size = float(step_size)
+        self.debug = bool(debug)
+        self.n_workers = n_workers if n_workers is not None else min(cpu_count() or 1, self.num_replicas)
+
+        # temperature ladder (geometric)
+        self.temps = [base_temp_K * (temp_scale ** i) for i in range(self.num_replicas)]
+        for i in range(self.num_replicas):
+            prot_copy = self.copy.deepcopy(protein)
+            ef = self.energy_fn_class(prot_copy)
+            # Store protein state dict for parallel workers
+            prot_dict = {k: v for k, v in prot_copy.__dict__.items() if k != 'coords'}
+            self.replicas.append({
+                'protein': prot_copy,
+                'energy_fn': ef,
+                'energy_fn_class': self.energy_fn_class,
+                'protein_dict': prot_dict,
+                'coords': prot_copy.coords.copy(),
+                'temp_K': float(self.temps[i]),
+                'T_energy': float(self.k_B * self.temps[i]),
+                'step_size': float(self.step_size),
+                'energy_dict': ef.total_energy()
+            })
+
+    def _propose_move_for_coords(self, coords, step_size):
+        # Local copy of torsion/pivot/random displacement logic
+        coords_old = coords.copy()
+        coords_new = coords_old.copy()
+        N = coords_old.shape[0]
+        if N <= 2:
+            return coords_new
+
+        r = np.random.rand()
+        if r < 0.7:
+            b = np.random.randint(0, N - 1)
+            p1 = coords_old[b]
+            p2 = coords_old[b+1]
+            axis = p2 - p1
+            axis_len = np.linalg.norm(axis)
+            if axis_len == 0:
+                return coords_new
+            axis = axis / axis_len
+            angle = np.random.normal(scale=step_size)
+            R = rotation_matrix(axis, angle)
+            idx = np.arange(b+1, N)
+            if idx.size > 0:
+                rel = coords_old[idx] - p1
+                rotated = (R @ rel.T).T + p1
+                coords_new[idx] = rotated
+            return coords_new
+        elif r < 0.9:
+            pivot = np.random.randint(0, N - 1)
+            angle = np.random.normal(scale=2.0*step_size)
+            axis = np.random.normal(size=3)
+            norm = np.linalg.norm(axis)
+            if norm == 0:
+                return coords_new
+            axis = axis / norm
+            R = rotation_matrix(axis, angle)
+            pivot_point = coords_old[pivot]
+            idx = np.arange(pivot + 1, N)
+            if idx.size > 0:
+                rel = coords_old[idx] - pivot_point
+                rotated = (R @ rel.T).T + pivot_point
+                coords_new[idx] = rotated
+            return coords_new
+        else:
+            i = np.random.randint(1, N - 1)
+            displacement = np.random.normal(scale=step_size, size=3)
+            coords_new[i] += displacement
+            if i - 1 >= 0:
+                coords_new[i-1] += 0.2 * displacement
+            if i + 1 < N:
+                coords_new[i+1] += 0.2 * displacement
+            return coords_new
+
+    def run(self):
+        # history will mirror the coldest replica (index 0) over time
+        history = []
+        best_coords = self.replicas[0]['coords'].copy()
+        best_e = self.replicas[0]['energy_dict']['total']
+
+        BOND_TOL = 1e-6
+        
+        # Setup multiprocessing pool for parallel replica evaluation
+        pool = None
+        use_parallel = self.n_workers > 1 and self.num_replicas > 1
+        if use_parallel:
+            try:
+                pool = Pool(processes=self.n_workers)
+            except Exception:
+                use_parallel = False
+        
+        try:
+            for step in range(self.max_steps):
+                # perform one MC step for each replica - in parallel if possible
+                if use_parallel:
+                    # Prepare tasks for parallel execution
+                    tasks = [(rep.copy(), rep['step_size'], rep['protein'].ca_distance, BOND_TOL, self.k_B) 
+                             for rep in self.replicas]
+                    # Evaluate all replicas in parallel
+                    updated_replicas = pool.map(_evaluate_replica_worker, tasks)
+                    # Update replicas with results
+                    for i, updated_rep in enumerate(updated_replicas):
+                        self.replicas[i]['coords'] = updated_rep['coords'].copy()
+                        self.replicas[i]['energy_dict'] = updated_rep['energy_dict']
+                        self.replicas[i]['protein'].coords = self.replicas[i]['coords']
+                        
+                        # track best overall
+                        cur_e = self.replicas[i]['energy_dict']['total']
+                        if cur_e < best_e:
+                            best_e = cur_e
+                            best_coords = self.replicas[i]['coords'].copy()
+                else:
+                    # Sequential evaluation (original logic)
+                    for i, rep in enumerate(self.replicas):
+                        coords_old = rep['coords'].copy()
+                        coords_new = self._propose_move_for_coords(coords_old, rep['step_size'])
+                        # bond check
+                        max_dev = self.max_bond_deviation(coords_new, r0=rep['protein'].ca_distance)
+                        if max_dev > BOND_TOL:
+                            # reject
+                            rep['coords'] = coords_old.copy()
+                            # keep energy_dict unchanged
+                            continue
+
+                        # evaluate
+                        rep['protein'].coords = coords_new
+                        energy_dict_new = rep['energy_fn'].total_energy()
+                        new_e = energy_dict_new['total']
+                        old_e = rep['energy_dict']['total']
+
+                        # acceptance
+                        if not np.isfinite(new_e) or not np.isfinite(old_e):
+                            rep['protein'].coords = coords_old.copy()
+                            continue
+
+                        if new_e < old_e:
+                            accept = True
+                        else:
+                            if np.random.rand() < math.exp(-(new_e - old_e) / max(rep['T_energy'], 1e-12)):
+                                accept = True
+                            else:
+                                accept = False
+
+                        if accept:
+                            rep['coords'] = coords_new.copy()
+                            rep['energy_dict'] = energy_dict_new
+                        else:
+                            rep['coords'] = coords_old.copy()
+
+                        # track best overall
+                        cur_e = rep['energy_dict']['total']
+                        if cur_e < best_e:
+                            best_e = cur_e
+                            best_coords = rep['coords'].copy()
+
+                # attempt exchanges between neighboring replicas every exchange_interval steps
+                if (step + 1) % self.exchange_interval == 0:
+                    for i in range(self.num_replicas - 1):
+                        rep_i = self.replicas[i]
+                        rep_j = self.replicas[i+1]
+                        Ei = rep_i['energy_dict']['total']
+                        Ej = rep_j['energy_dict']['total']
+                        beta_i = 1.0 / (self.k_B * rep_i['temp_K'])
+                        beta_j = 1.0 / (self.k_B * rep_j['temp_K'])
+                        # acceptance for swap: exp((beta_i - beta_j) * (Ej - Ei))
+                        try:
+                            prob = math.exp((beta_i - beta_j) * (Ej - Ei))
+                        except OverflowError:
+                            prob = float('inf') if (beta_i - beta_j) * (Ej - Ei) > 0 else 0.0
+                        if np.random.rand() < min(1.0, prob):
+                            # swap coordinates and energy_dict
+                            tmp_coords = rep_i['coords'].copy()
+                            tmp_ed = rep_i['energy_dict']
+                            rep_i['coords'] = rep_j['coords'].copy()
+                            rep_i['protein'].coords = rep_i['coords']
+                            rep_i['energy_dict'] = rep_j['energy_dict']
+                            rep_j['coords'] = tmp_coords.copy()
+                            rep_j['protein'].coords = rep_j['coords']
+                            rep_j['energy_dict'] = tmp_ed
+
+                # append coldest replica state to history for GUI plotting
+                cold = self.replicas[0]
+                history.append((cold['coords'].copy(), cold['energy_dict']))
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+        # ensure protein ends at best found
+        return best_coords, best_e, history
 
 
 class SimulatedAnnealer:
-    def __init__(self, protein, energy_fn, temp_K=300.0, k_B=0.0019872041, cooling=0.995, max_steps=2000, step_size=0.4, max_energy_jump=1e6, debug=False, energy_term_threshold=1e5):
+    def __init__(self, protein, energy_fn, temp_K=300.0, k_B=0.0019872041, cooling=0.995, max_steps=2000, step_size=0.4, max_energy_jump=1e6, debug=False, energy_term_threshold=1e5, n_workers=None):
         self.protein = protein
         self.energy_fn = energy_fn
         # store temperature in Kelvin and convert to energy units via k_B (kcal/mol·K)
@@ -21,6 +333,8 @@ class SimulatedAnnealer:
         self.debug = bool(debug)
         # threshold for any single energy term magnitude to be considered suspicious
         self.energy_term_threshold = float(energy_term_threshold)
+        # parallel evaluation: use all available cores by default
+        self.n_workers = n_workers if n_workers is not None else (cpu_count() or 1)
 
     def propose_move(self):
         coords_old = self.protein.coords.copy()
