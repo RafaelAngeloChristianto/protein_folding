@@ -14,7 +14,10 @@ from matplotlib.figure import Figure
 from compbio_fp.models import Protein
 from compbio_fp.energy import EnergyFunction
 from compbio_fp.optimizer import SimulatedAnnealer, ReplicaExchange
+from compbio_fp.multiscale_optimizer import MultiScaleOptimizer, AdaptiveOptimizer
 from compbio_fp.protein_builder import build_backbone_from_CA, pack_sidechains, write_pdb
+from compbio_fp.fasta_db import load_database_sequences
+from compbio_fp.alphafold_compare import compare_with_alphafold
 
 class ProteinFoldingGUI:
     def __init__(self):
@@ -24,10 +27,14 @@ class ProteinFoldingGUI:
         
         # Variables
         self.sequence_var = tk.StringVar(value="ACDEFGHIKLMNPQR")
-        self.steps_var = tk.StringVar(value="1500")
-        self.temp_var = tk.StringVar(value="300")
+        self.steps_var = tk.StringVar(value="25000")
+        self.temp_var = tk.StringVar(value="2000")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar()
+        self.db_sequence_var = tk.StringVar()
+        
+        # Load database sequences
+        self.db_sequences = load_database_sequences()
         
         self.history = []
         self.current_frame = 0
@@ -50,9 +57,18 @@ class ProteinFoldingGUI:
         control_frame = ttk.LabelFrame(main_frame, text="Controls", padding="10")
         control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0,10))
         
-        # Sequence
+        # Database sequence selection
+        ttk.Label(control_frame, text="Database Sequences:").pack(anchor=tk.W)
+        db_options = ["Custom"] + [f"{header[:50]}..." if len(header) > 50 else header for header in self.db_sequences.keys()]
+        self.db_combo = ttk.Combobox(control_frame, textvariable=self.db_sequence_var, values=db_options, state='readonly', width=25)
+        self.db_combo.set("Custom")
+        self.db_combo.pack(pady=(0,5))
+        self.db_combo.bind('<<ComboboxSelected>>', self.on_db_sequence_selected)
+        
+        # Manual sequence entry
         ttk.Label(control_frame, text="Sequence:").pack(anchor=tk.W)
-        ttk.Entry(control_frame, textvariable=self.sequence_var, width=20).pack(pady=(0,10))
+        self.sequence_entry = ttk.Entry(control_frame, textvariable=self.sequence_var, width=20)
+        self.sequence_entry.pack(pady=(0,10))
         
         # Steps
         ttk.Label(control_frame, text="Steps:").pack(anchor=tk.W)
@@ -81,15 +97,15 @@ class ProteinFoldingGUI:
 
         # Optimizer selection
         ttk.Label(control_frame, text="Optimizer:").pack(anchor=tk.W, pady=(10,0))
-        self.optimizer_var = tk.StringVar(value='Simulated Annealing')
+        self.optimizer_var = tk.StringVar(value='Adaptive')
         self.optimizer_combo = ttk.Combobox(control_frame, textvariable=self.optimizer_var,
-                            values=['Simulated Annealing', 'Parallel Tempering'], state='readonly', width=18)
+                            values=['Adaptive', 'Multi-Scale', 'Simulated Annealing', 'Parallel Tempering'], state='readonly', width=18)
         self.optimizer_combo.pack(pady=(0,5))
         self.optimizer_combo.bind('<<ComboboxSelected>>', lambda e: self._on_optimizer_change())
 
         # Parallel Tempering params (hidden unless PT selected)
-        self.replicas_var = tk.IntVar(value=4)
-        self.exchange_interval_var = tk.IntVar(value=10)
+        self.replicas_var = tk.IntVar(value=6)
+        self.exchange_interval_var = tk.IntVar(value=8)
         self.pt_frame = ttk.Frame(control_frame)
         ttk.Label(self.pt_frame, text="Replicas:").grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(self.pt_frame, textvariable=self.replicas_var, width=6).grid(row=0, column=1, padx=(4,0))
@@ -170,11 +186,32 @@ class ProteinFoldingGUI:
         # Results tab: scrolled text for numeric output
         self.results_text = scrolledtext.ScrolledText(self.results_tab, wrap=tk.WORD, height=20)
         self.results_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # AlphaFold comparison button
+        af_frame = ttk.Frame(self.results_tab)
+        af_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.alphafold_btn = ttk.Button(af_frame, text="Compare with AlphaFold", command=self.compare_alphafold)
+        self.alphafold_btn.pack(side=tk.LEFT)
 
         self.fig_structure.tight_layout()
         self.fig_graphs.tight_layout()
         # Ensure optimizer UI initial state
         self._on_optimizer_change()
+    
+    def on_db_sequence_selected(self, event=None):
+        """Handle database sequence selection"""
+        selected = self.db_sequence_var.get()
+        if selected == "Custom":
+            self.sequence_entry.config(state='normal')
+            return
+        
+        # Find the full header that matches the truncated display
+        for header, sequence in self.db_sequences.items():
+            display_header = f"{header[:50]}..." if len(header) > 50 else header
+            if display_header == selected:
+                self.sequence_var.set(sequence)
+                self.sequence_entry.config(state='readonly')
+                break
 
     def _on_optimizer_change(self):
         """Show/hide optimizer-specific parameter controls."""
@@ -236,6 +273,8 @@ class ProteinFoldingGUI:
             results = []
             # define optimizer configurations to run
             optimizers = [
+                ('Adaptive', 'ADAPTIVE'),
+                ('Multi-Scale', 'MULTISCALE'),
                 ('Simulated Annealing', 'SA'),
                 ('Parallel Tempering', 'PT')
             ]
@@ -255,10 +294,16 @@ class ProteinFoldingGUI:
                     nrep = int(self.replicas_var.get()) if hasattr(self, 'replicas_var') else 4
                     exch = int(self.exchange_interval_var.get()) if hasattr(self, 'exchange_interval_var') else 10
                     optimizer = ReplicaExchange(protein, energy_fn, num_replicas=nrep, exchange_interval=exch, base_temp_K=temp, max_steps=steps)
-                else:
-                    optimizer = SimulatedAnnealer(protein, energy_fn, temp_K=temp, max_steps=steps)
-
-                best_coords, best_e, history = optimizer.run()
+                    best_coords, best_e, history = optimizer.run()
+                elif key == 'MULTISCALE':
+                    optimizer = MultiScaleOptimizer(protein, EnergyFunction, debug=False)
+                    best_coords, best_e, history = optimizer.run(steps)
+                elif key == 'ADAPTIVE':
+                    optimizer = AdaptiveOptimizer(protein, EnergyFunction, debug=False)
+                    best_coords, best_e, history = optimizer.run(steps)
+                else:  # SA
+                    optimizer = SimulatedAnnealer(protein, energy_fn, temp_K=temp, max_steps=steps, adaptive_cooling=True)
+                    best_coords, best_e, history = optimizer.run()
                 elapsed = time.time() - start
                 results.append({
                     'name': name,
@@ -331,13 +376,17 @@ class ProteinFoldingGUI:
             # debug: print the temperature being used to construct the optimizer
             print(f"[DEBUG] Starting temperature (K) passed to optimizer: {temp}")
             # construct selected optimizer
-            opt_choice = self.optimizer_var.get() if hasattr(self, 'optimizer_var') else 'Simulated Annealing'
+            opt_choice = self.optimizer_var.get() if hasattr(self, 'optimizer_var') else 'Adaptive'
             if opt_choice == 'Parallel Tempering':
                 nrep = int(self.replicas_var.get()) if hasattr(self, 'replicas_var') else 4
                 exch = int(self.exchange_interval_var.get()) if hasattr(self, 'exchange_interval_var') else 10
                 optimizer = ReplicaExchange(protein, energy_fn, num_replicas=nrep, exchange_interval=exch, base_temp_K=temp, max_steps=steps)
-            else:
-                optimizer = SimulatedAnnealer(protein, energy_fn, temp_K=temp, max_steps=steps)
+            elif opt_choice == 'Multi-Scale':
+                optimizer = MultiScaleOptimizer(protein, EnergyFunction, debug=True)
+            elif opt_choice == 'Adaptive':
+                optimizer = AdaptiveOptimizer(protein, EnergyFunction, debug=True)
+            else:  # Simulated Annealing
+                optimizer = SimulatedAnnealer(protein, energy_fn, temp_K=temp, max_steps=steps, adaptive_cooling=True)
             # capture initial energy-scale temperature (kcal/mol units) for display
             try:
                 self.start_T_energy = optimizer.T_energy
@@ -349,7 +398,10 @@ class ProteinFoldingGUI:
             except Exception:
                 self.start_cooling = 0.995
             
-            best_coords, best_e, self.history = optimizer.run()
+            if opt_choice in ['Multi-Scale', 'Adaptive']:
+                best_coords, best_e, self.history = optimizer.run(steps)
+            else:
+                best_coords, best_e, self.history = optimizer.run()
             # store best results for later display
             self.best_coords = best_coords
             self.best_energy = best_e
@@ -374,6 +426,8 @@ class ProteinFoldingGUI:
         # populate the Results tab with numeric outputs
         try:
             self.update_results_text()
+            # Auto-run AlphaFold comparison
+            self.compare_alphafold()
         except Exception:
             pass
         # Display contact map for the single optimizer
@@ -620,6 +674,61 @@ class ProteinFoldingGUI:
         # Insert into scrolled text
         self.results_text.delete('1.0', tk.END)
         self.results_text.insert(tk.END, "\n".join(lines))
+        
+    def compare_alphafold(self):
+        """Compare current structure with AlphaFold"""
+        if not hasattr(self, 'best_coords') or self.best_coords is None:
+            self.results_text.insert(tk.END, "\nNo structure available for comparison\n")
+            return
+            
+        sequence = self.sequence_var.get().strip().upper()
+        
+        # Create temporary protein object for comparison
+        from compbio_fp.models import Protein
+        protein = Protein(sequence)
+        protein.coords = self.best_coords
+        
+        # Compare with AlphaFold
+        af_result = compare_with_alphafold(protein)
+        
+        if af_result:
+            self.results_text.insert(tk.END, "\n=== AlphaFold Comparison ===\n")
+            self.results_text.insert(tk.END, f"UniProt ID: {af_result['uniprot_id']}\n")
+            self.results_text.insert(tk.END, f"RMSD: {af_result['rmsd']:.2f} Å\n")
+            self.results_text.insert(tk.END, f"GDT-TS Score: {af_result['gdt_ts']:.1f}%\n")
+            
+            # Display new enhanced metrics if available
+            if 'tm_score' in af_result:
+                self.results_text.insert(tk.END, f"TM-Score: {af_result['tm_score']:.3f}\n")
+            if 'local_accuracy' in af_result:
+                self.results_text.insert(tk.END, f"Local Accuracy: {af_result['local_accuracy']:.1%}\n")
+            if 'accuracy_score' in af_result:
+                self.results_text.insert(tk.END, f"Overall Accuracy Score: {af_result['accuracy_score']:.1f}%\n")
+            
+            self.results_text.insert(tk.END, f"Coverage: {af_result['coverage']:.1f}%\n")
+            
+            # Enhanced accuracy assessment using multiple metrics
+            rmsd = af_result['rmsd']
+            gdt_ts = af_result['gdt_ts']
+            tm_score = af_result.get('tm_score', 0)
+            
+            if rmsd < 3.0 and gdt_ts > 80 and tm_score > 0.7:
+                accuracy = "Excellent (Near-native)"
+            elif rmsd < 5.0 and gdt_ts > 60 and tm_score > 0.5:
+                accuracy = "Very Good"
+            elif rmsd < 8.0 and gdt_ts > 40 and tm_score > 0.3:
+                accuracy = "Good"
+            elif rmsd < 12.0 and gdt_ts > 25:
+                accuracy = "Fair"
+            else:
+                accuracy = "Poor"
+            
+            self.results_text.insert(tk.END, f"Structural Accuracy: {accuracy}\n")
+        else:
+            self.results_text.insert(tk.END, "\n=== AlphaFold Comparison ===\n")
+            self.results_text.insert(tk.END, "No matching AlphaFold structure found\n")
+        
+        self.results_text.see(tk.END)
         
     def toggle_animation(self):
         if not self.animation_running:

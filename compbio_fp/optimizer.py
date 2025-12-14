@@ -101,15 +101,14 @@ def _evaluate_replica_worker(args):
 
 
 class ReplicaExchange:
-    """A minimal Parallel Tempering / Replica Exchange Monte Carlo implementation.
+    """Enhanced Parallel Tempering / Replica Exchange Monte Carlo for maximum accuracy.
 
     This runs `num_replicas` Monte-Carlo replicas at different fixed temperatures
     and attempts swaps between neighboring replicas every `exchange_interval`
-    steps. The implementation is intentionally simple and reuses the same
-    propose-move style used by SimulatedAnnealer.
+    steps. Enhanced for 80%+ accuracy target.
     """
-    def __init__(self, protein, energy_fn, num_replicas=4, exchange_interval=10, base_temp_K=300.0,
-                 temp_scale=1.5, k_B=0.0019872041, max_steps=2000, step_size=0.4, debug=False, n_workers=None):
+    def __init__(self, protein, energy_fn, num_replicas=6, exchange_interval=8, base_temp_K=400.0,
+                 temp_scale=1.4, k_B=0.0019872041, max_steps=25000, step_size=0.3, debug=False, n_workers=None):
         import copy
         from .utils import max_bond_deviation
 
@@ -316,7 +315,7 @@ class ReplicaExchange:
 
 
 class SimulatedAnnealer:
-    def __init__(self, protein, energy_fn, temp_K=300.0, k_B=0.0019872041, cooling=0.995, max_steps=2000, step_size=0.4, max_energy_jump=1e6, debug=False, energy_term_threshold=1e5, n_workers=None):
+    def __init__(self, protein, energy_fn, temp_K=2000.0, k_B=0.0019872041, cooling=0.9985, max_steps=25000, step_size=0.08, max_energy_jump=1e6, debug=False, energy_term_threshold=1e5, n_workers=None, adaptive_cooling=True):
         self.protein = protein
         self.energy_fn = energy_fn
         # store temperature in Kelvin and convert to energy units via k_B (kcal/mol·K)
@@ -335,6 +334,9 @@ class SimulatedAnnealer:
         self.energy_term_threshold = float(energy_term_threshold)
         # parallel evaluation: use all available cores by default
         self.n_workers = n_workers if n_workers is not None else (cpu_count() or 1)
+        self.adaptive_cooling = adaptive_cooling
+        self.energy_plateau_count = 0
+        self.last_best_energy = float('inf')
 
     def propose_move(self):
         coords_old = self.protein.coords.copy()
@@ -343,12 +345,11 @@ class SimulatedAnnealer:
         if N <= 2:
             return coords_new, coords_old
 
-        # Mostly use torsion-angle (bond-axis) moves which preserve covalent bond lengths
+        # Enhanced move set for maximum accuracy
         r = np.random.rand()
-        if r < 0.7:
-            # pick a bond index b between 0 and N-2
+        if r < 0.6:  # More frequent torsion moves
+            # Enhanced torsion-angle moves with better sampling
             b = np.random.randint(0, N - 1)
-            # rotation axis is the vector from coords[b] to coords[b+1]
             p1 = coords_old[b]
             p2 = coords_old[b+1]
             axis = p2 - p1
@@ -356,26 +357,47 @@ class SimulatedAnnealer:
             if axis_len == 0:
                 return coords_new, coords_old
             axis = axis / axis_len
-            # sample a torsion angle (radians)
-            angle = np.random.normal(scale=self.step_size)
+            
+            # Enhanced angle sampling with temperature dependence
+            temp_factor = max(0.1, self.temp_K / 2000.0)  # Scale with temperature
+            angle = np.random.normal(scale=self.step_size * temp_factor)
+            
             R = rotation_matrix(axis, angle)
-            # rotate downstream segment (b+1..N-1) around axis passing through p1->p2
             idx = np.arange(b+1, N)
             if idx.size > 0:
                 rel = coords_old[idx] - p1
-                # project rel onto plane orthogonal to axis and rotate
                 rotated = (R @ rel.T).T + p1
                 coords_new[idx] = rotated
             return coords_new, coords_old
-        elif r < 0.9:
-            # occasional larger pivot move (random axis through a pivot)
-            pivot = np.random.randint(0, N - 1)
-            angle = np.random.normal(scale=2.0*self.step_size)
-            axis = np.random.normal(size=3)
-            norm = np.linalg.norm(axis)
-            if norm == 0:
-                return coords_new, coords_old
-            axis = axis / norm
+        elif r < 0.8:  # More pivot moves
+            # Enhanced pivot moves with better axis selection
+            pivot = np.random.randint(1, N - 1)  # Avoid endpoints
+            
+            # Bias toward middle of chain for better global moves
+            if N > 10:
+                center = N // 2
+                pivot = np.random.choice([center + np.random.randint(-N//4, N//4), 
+                                        np.random.randint(1, N-1)])
+                pivot = max(1, min(N-2, pivot))
+            
+            temp_factor = max(0.2, self.temp_K / 2000.0)
+            angle = np.random.normal(scale=1.5*self.step_size * temp_factor)
+            
+            # Better axis selection (sometimes use local geometry)
+            if np.random.rand() < 0.3 and pivot > 0 and pivot < N-1:
+                # Use local geometry for axis
+                v1 = coords_old[pivot] - coords_old[pivot-1]
+                v2 = coords_old[pivot+1] - coords_old[pivot]
+                axis = np.cross(v1, v2)
+                if np.linalg.norm(axis) > 1e-6:
+                    axis = axis / np.linalg.norm(axis)
+                else:
+                    axis = np.random.normal(size=3)
+                    axis = axis / np.linalg.norm(axis)
+            else:
+                axis = np.random.normal(size=3)
+                axis = axis / np.linalg.norm(axis)
+            
             R = rotation_matrix(axis, angle)
             pivot_point = coords_old[pivot]
             idx = np.arange(pivot + 1, N)
@@ -384,15 +406,39 @@ class SimulatedAnnealer:
                 rotated = (R @ rel.T).T + pivot_point
                 coords_new[idx] = rotated
             return coords_new, coords_old
-        else:
-            # fallback: small local displacement similar to original implementation
+        elif r < 0.95:  # Local moves
+            # Enhanced local displacement with cooperative motion
             i = np.random.randint(1, N - 1)
-            displacement = np.random.normal(scale=self.step_size, size=3)
+            temp_factor = max(0.1, self.temp_K / 2000.0)
+            displacement = np.random.normal(scale=self.step_size * temp_factor, size=3)
+            
+            # Cooperative motion with neighbors
             coords_new[i] += displacement
             if i - 1 >= 0:
-                coords_new[i-1] += 0.2 * displacement
+                coords_new[i-1] += 0.3 * displacement  # Stronger coupling
             if i + 1 < N:
-                coords_new[i+1] += 0.2 * displacement
+                coords_new[i+1] += 0.3 * displacement  # Stronger coupling
+            
+            # Sometimes include next neighbors
+            if np.random.rand() < 0.3:
+                if i - 2 >= 0:
+                    coords_new[i-2] += 0.1 * displacement
+                if i + 2 < N:
+                    coords_new[i+2] += 0.1 * displacement
+            
+            return coords_new, coords_old
+        else:
+            # New: segment flip moves for better sampling
+            if N > 6:
+                # Flip a small segment
+                start = np.random.randint(1, N - 4)
+                length = min(np.random.randint(2, 5), N - start - 1)
+                end = start + length
+                
+                # Flip the segment
+                segment = coords_old[start:end+1].copy()
+                coords_new[start:end+1] = segment[::-1]
+            
             return coords_new, coords_old
 
     def run(self):
@@ -521,12 +567,28 @@ class SimulatedAnnealer:
                 # record the accepted energy (no spike)
                 self.history.append((coords.copy(), energy_dict_new))
 
-            # cool in Kelvin and update energy-scale temperature
+            # Fast adaptive cooling (less frequent checks)
+            if self.adaptive_cooling and step % 200 == 0:  # Less frequent for speed
+                if abs(best_e - self.last_best_energy) < 0.01:
+                    self.energy_plateau_count += 1
+                    if self.energy_plateau_count > 3:
+                        self.cooling *= 0.98
+                        self.step_size *= 1.05
+                        self.energy_plateau_count = 0
+                else:
+                    self.energy_plateau_count = 0
+                    self.last_best_energy = best_e
+            
+            # Enhanced cooling schedule
             self.temp_K *= self.cooling
             self.T_energy = self.k_B * self.temp_K
-            if step % 500 == 0 and step > 0:
-                self.step_size *= 0.9
-            if self.temp_K < 1e-6:
+            
+            # Fast step size reduction
+            if step % 1000 == 0 and step > 0:
+                self.step_size *= 0.95
+            
+            # Lower temperature threshold for longer optimization
+            if self.temp_K < 1e-8:
                 break
         self.protein.coords = best_coords.copy()
         return best_coords, best_e, self.history

@@ -8,9 +8,10 @@ from .energy import EnergyFunction
 from .optimizer import SimulatedAnnealer
 from .viz import animate_history
 from .utils import validate_sequence, open_with_default_viewer, energy_series
+from .alphafold_compare import compare_with_alphafold, get_sequence_from_uniprot_id
 
 
-def demo_run(sequence="ACDEFGHIKLMNPQR", steps=1500, show_plot=True, save_animation=None, step_size=None, temp_K=300.0, include_sidechains=False):
+def demo_run(sequence="ACDEFGHIKLMNPQR", steps=1500, show_plot=True, save_animation=None, step_size=None, temp_K=300.0, include_sidechains=False, uniprot_id=None):
     if steps is None:
         # interactive prompt for steps
         try:
@@ -41,6 +42,18 @@ def demo_run(sequence="ACDEFGHIKLMNPQR", steps=1500, show_plot=True, save_animat
     best_coords, best_e, history = optimizer.run()
     print("Best energy found:", best_e)
     print("RMSD to initial structure:", protein.rmsd_to(protein._init_coords()))
+    
+    # AlphaFold comparison
+    af_result = compare_with_alphafold(protein)
+    if af_result:
+        print(f"\n=== AlphaFold Comparison (UniProt: {af_result['uniprot_id']}) ===")
+        print(f"RMSD to AlphaFold: {af_result['rmsd']:.2f} Å")
+        print(f"GDT-TS Score: {af_result['gdt_ts']:.1f}%")
+        print(f"Structure Coverage: {af_result['coverage']:.1f}%")
+        print(f"Lengths - Simulated: {af_result['simulated_length']}, AlphaFold: {af_result['alphafold_length']}")
+    else:
+        print("\n=== AlphaFold Comparison ===")
+        print("No matching AlphaFold structure found in database")
     # Plot detailed energies (optional)
     try:
         import matplotlib.pyplot as plt
@@ -142,6 +155,7 @@ def main(argv=None):
     parser.add_argument("--step-size", dest="step_size", type=float, default=None, help="Torsion move step size (radians). If not given, demo default is used.")
     parser.add_argument("--temp", dest="temp", type=float, default=300.0, help="Simulation temperature in Kelvin (default 300 K)")
     parser.add_argument("--sidechains", dest="sidechains", action="store_true", help="Include simple side-chain beads (one extra bead per residue)")
+    parser.add_argument("--uniprot", dest="uniprot_id", help="UniProt ID for AlphaFold comparison (auto-detected if not provided)")
     args = parser.parse_args(argv)
 
     seq = None
@@ -170,6 +184,7 @@ def main(argv=None):
         extra['step_size'] = args.step_size
     extra['temp_K'] = args.temp
     extra['include_sidechains'] = args.sidechains
+    extra['uniprot_id'] = args.uniprot_id
     demo_run(sequence=seq, steps=args.steps, show_plot=args.show_plot, save_animation=args.save_animation, **extra)
 
 
