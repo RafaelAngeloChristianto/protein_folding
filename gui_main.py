@@ -13,8 +13,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from compbio_fp.models import Protein
 from compbio_fp.energy import EnergyFunction
-from compbio_fp.optimizer import SimulatedAnnealer, ReplicaExchange
-from compbio_fp.multiscale_optimizer import MultiScaleOptimizer, AdaptiveOptimizer
+from compbio_fp.optimizer import SimulatedAnnealer, ReplicaExchange, MultiScaleOptimizer, AdaptiveOptimizer
 from compbio_fp.protein_builder import build_backbone_from_CA, pack_sidechains, write_pdb
 from compbio_fp.fasta_db import load_database_sequences
 from compbio_fp.alphafold_compare import compare_with_alphafold
@@ -27,7 +26,7 @@ class ProteinFoldingGUI:
         
         # Variables
         self.sequence_var = tk.StringVar(value="ACDEFGHIKLMNPQR")
-        self.steps_var = tk.StringVar(value="25000")
+        self.steps_var = tk.StringVar(value="10000")
         self.temp_var = tk.StringVar(value="2000")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar()
@@ -161,12 +160,14 @@ class ProteinFoldingGUI:
         self.canvas_matrix = FigureCanvasTkAgg(self.fig_matrix, self.matrixes_tab)
         self.canvas_matrix.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Additional small structures figure to compare optimizer 3D results
-        self.fig_structs = Figure(figsize=(8, 3))
-        self.ax_struct1 = self.fig_structs.add_subplot(1, 2, 1, projection='3d')
-        self.ax_struct2 = self.fig_structs.add_subplot(1, 2, 2, projection='3d')
+        # Additional small structures figure to compare optimizer 3D results (2x2 grid for 4 optimizers)
+        self.fig_structs = Figure(figsize=(10, 8))
+        self.ax_struct1 = self.fig_structs.add_subplot(2, 2, 1, projection='3d')
+        self.ax_struct2 = self.fig_structs.add_subplot(2, 2, 2, projection='3d')
+        self.ax_struct3 = self.fig_structs.add_subplot(2, 2, 3, projection='3d')
+        self.ax_struct4 = self.fig_structs.add_subplot(2, 2, 4, projection='3d')
         # Place the comparison 3D canvases in the Structure tab so
-        # "Run All Optimizers" shows the two optimizer results there.
+        # "Run All Optimizers" shows all four optimizer results there.
         self.canvas_structs = FigureCanvasTkAgg(self.fig_structs, self.structure_tab)
         # initially hide the comparison canvas; show it only after Run All
         self.canvas_structs.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(5,0))
@@ -183,9 +184,27 @@ class ProteinFoldingGUI:
                 # Older matplotlib may not support set_box_aspect; ignore
                 pass
 
-        # Results tab: scrolled text for numeric output
-        self.results_text = scrolledtext.ScrolledText(self.results_tab, wrap=tk.WORD, height=20)
-        self.results_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Results tab: scrolled text for numeric output with improved aesthetics
+        self.results_text = scrolledtext.ScrolledText(
+            self.results_tab, 
+            wrap=tk.WORD, 
+            height=20,
+            font=('Consolas', 10),  # Monospace font for better alignment
+            bg='#f5f5f5',  # Light gray background
+            fg='#2c3e50',  # Dark text
+            padx=10,
+            pady=10,
+            relief=tk.FLAT,
+            borderwidth=0
+        )
+        self.results_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Configure text tags for styling
+        self.results_text.tag_config('header', font=('Consolas', 12, 'bold'), foreground='#2c3e50')
+        self.results_text.tag_config('section', font=('Consolas', 10, 'bold'), foreground='#3498db')
+        self.results_text.tag_config('winner', font=('Consolas', 10, 'bold'), foreground='#27ae60')
+        self.results_text.tag_config('metric', foreground='#34495e')
+        self.results_text.tag_config('value', foreground='#e74c3c')
         
         # AlphaFold comparison button
         af_frame = ttk.Frame(self.results_tab)
@@ -356,7 +375,7 @@ class ProteinFoldingGUI:
                     pass
             else:
                 # clear comparison axes
-                self.ax_struct1.clear(); self.ax_struct2.clear(); self.canvas_structs.draw()
+                self.ax_struct1.clear(); self.ax_struct2.clear(); self.ax_struct3.clear(); self.ax_struct4.clear(); self.canvas_structs.draw()
         except Exception:
             pass
         try:
@@ -459,70 +478,63 @@ class ProteinFoldingGUI:
             pass
 
     def plot_structs_comparison(self, optimizer_results):
-        """Draw best-structure 3D views side-by-side for each optimizer in `optimizer_results`.
+        """Draw best-structure 3D views for all optimizers in `optimizer_results` in a 2x2 grid.
 
         Expects `optimizer_results` to be a list of dicts with keys 'name' and 'best_coords'.
         """
         try:
-            # Prepare axes
+            # Prepare all axes
             self.ax_struct1.clear()
             self.ax_struct2.clear()
+            self.ax_struct3.clear()
+            self.ax_struct4.clear()
+            
+            axes = [self.ax_struct1, self.ax_struct2, self.ax_struct3, self.ax_struct4]
 
-            # Draw first two optimizers if available
-            if len(optimizer_results) >= 1:
-                r0 = optimizer_results[0]
-                coords0 = np.asarray(r0.get('best_coords'))
-                hydro0 = r0.get('hydro')
-                if coords0.size:
-                    self.ax_struct1.plot(coords0[:,0], coords0[:,1], coords0[:,2], color='gray', linewidth=1)
-                    # color by hydrophobicity when available
-                    if hydro0 is None:
-                        self.ax_struct1.scatter(coords0[:,0], coords0[:,1], coords0[:,2], c='C0', s=30)
-                    else:
-                        try:
-                            import matplotlib.cm as cm
-                            import matplotlib.colors as mcolors
-                            mode = self.hydro_mode_var.get() if hasattr(self, 'hydro_mode_var') else 'Continuous'
-                            if mode == 'Continuous':
-                                cmap = cm.get_cmap('coolwarm')
-                                norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
-                                self.ax_struct1.scatter(coords0[:,0], coords0[:,1], coords0[:,2], c=hydro0, cmap=cmap, norm=norm, s=30)
-                            else:
-                                thresh = float(getattr(self, 'hydro_thresh_var', 0.5)) if not hasattr(self, 'hydro_thresh_var') else float(self.hydro_thresh_var.get())
-                                cols = ['orange' if h > thresh else 'cyan' for h in hydro0]
-                                self.ax_struct1.scatter(coords0[:,0], coords0[:,1], coords0[:,2], c=cols, s=30)
-                        except Exception:
-                            self.ax_struct1.scatter(coords0[:,0], coords0[:,1], coords0[:,2], c='C0', s=30)
-                    self.ax_struct1.set_title(r0.get('name'))
-            if len(optimizer_results) >= 2:
-                r1 = optimizer_results[1]
-                coords1 = np.asarray(r1.get('best_coords'))
-                hydro1 = r1.get('hydro')
-                if coords1.size:
-                    self.ax_struct2.plot(coords1[:,0], coords1[:,1], coords1[:,2], color='gray', linewidth=1)
-                    # color by hydrophobicity when available
-                    if hydro1 is None:
-                        self.ax_struct2.scatter(coords1[:,0], coords1[:,1], coords1[:,2], c='C1', s=30)
-                    else:
-                        try:
-                            import matplotlib.cm as cm
-                            import matplotlib.colors as mcolors
-                            mode = self.hydro_mode_var.get() if hasattr(self, 'hydro_mode_var') else 'Continuous'
-                            if mode == 'Continuous':
-                                cmap = cm.get_cmap('coolwarm')
-                                norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
-                                self.ax_struct2.scatter(coords1[:,0], coords1[:,1], coords1[:,2], c=hydro1, cmap=cmap, norm=norm, s=30)
-                            else:
-                                thresh = float(getattr(self, 'hydro_thresh_var', 0.5)) if not hasattr(self, 'hydro_thresh_var') else float(self.hydro_thresh_var.get())
-                                cols = ['orange' if h > thresh else 'cyan' for h in hydro1]
-                                self.ax_struct2.scatter(coords1[:,0], coords1[:,1], coords1[:,2], c=cols, s=30)
-                        except Exception:
-                            self.ax_struct2.scatter(coords1[:,0], coords1[:,1], coords1[:,2], c='C1', s=30)
-                    self.ax_struct2.set_title(r1.get('name'))
-
-            # If fewer than 2 results, leave the other empty
+            # Draw all available optimizers (up to 4)
+            for idx, result in enumerate(optimizer_results[:4]):
+                if idx >= 4:
+                    break
+                    
+                ax = axes[idx]
+                coords = np.asarray(result.get('best_coords'))
+                hydro = result.get('hydro')
+                
+                if coords.size == 0:
+                    continue
+                    
+                # Draw backbone
+                ax.plot(coords[:,0], coords[:,1], coords[:,2], color='gray', linewidth=1)
+                
+                # Color by hydrophobicity if available
+                if hydro is None:
+                    ax.scatter(coords[:,0], coords[:,1], coords[:,2], c=f'C{idx}', s=30)
+                else:
+                    try:
+                        import matplotlib.cm as cm
+                        import matplotlib.colors as mcolors
+                        mode = self.hydro_mode_var.get() if hasattr(self, 'hydro_mode_var') else 'Continuous'
+                        if mode == 'Continuous':
+                            cmap = cm.get_cmap('coolwarm')
+                            norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+                            ax.scatter(coords[:,0], coords[:,1], coords[:,2], c=hydro, cmap=cmap, norm=norm, s=30)
+                        else:
+                            thresh = float(getattr(self, 'hydro_thresh_var', 0.5)) if hasattr(self, 'hydro_thresh_var') else 0.5
+                            cols = ['orange' if h > thresh else 'cyan' for h in hydro]
+                            ax.scatter(coords[:,0], coords[:,1], coords[:,2], c=cols, s=30)
+                    except Exception:
+                        ax.scatter(coords[:,0], coords[:,1], coords[:,2], c=f'C{idx}', s=30)
+                
+                ax.set_title(result.get('name'), fontsize=10)
+                ax.set_xlabel('X', fontsize=8)
+                ax.set_ylabel('Y', fontsize=8)
+                ax.set_zlabel('Z', fontsize=8)
+                ax.tick_params(labelsize=7)
+            
+            self.fig_structs.tight_layout()
             self.canvas_structs.draw()
-        except Exception:
+        except Exception as e:
+            print(f"Error in plot_structs_comparison: {e}")
             pass
 
     # Helpers to control which canvases are visible in the Structure tab
@@ -551,30 +563,12 @@ class ProteinFoldingGUI:
             pass
 
     def update_results_text(self):
-        """Populate the Results tab with numeric summaries."""
+        """Populate the Results tab with numeric summaries using styled text."""
+        self.results_text.delete('1.0', tk.END)
+        
         if not self.history:
-            self.results_text.delete('1.0', tk.END)
             self.results_text.insert(tk.END, "No results available.\n")
             return
-
-        # initial energy and breakdown
-        initial_energy = self.history[0][1].get('total') if isinstance(self.history[0][1], dict) else None
-        energy_breakdown = self.history[0][1] if isinstance(self.history[0][1], dict) else {}
-
-        # best energy found
-        best_energy = getattr(self, 'best_energy', None)
-        if best_energy is None:
-            energies = [h[1].get('total') for h in self.history if isinstance(h[1], dict)]
-            best_energy = min(energies) if energies else None
-
-        # RMSD to initial structure (use best_coords if available, otherwise final)
-        try:
-            initial_coords = self.history[0][0]
-            target_coords = getattr(self, 'best_coords', self.history[-1][0])
-            diff = target_coords - initial_coords
-            rmsd = np.sqrt(np.mean(np.sum(diff**2, axis=1)))
-        except Exception:
-            rmsd = None
 
         # Helper metrics
         def radius_of_gyration(coords):
@@ -610,7 +604,6 @@ class ProteinFoldingGUI:
             N = c.shape[0]
             if N < 2:
                 return 0.0
-            # compute pairwise distances upper triangle
             dists = np.sqrt(((c[None, :, :] - c[:, None, :]) ** 2).sum(axis=2))
             iu = np.triu_indices(N, k=1)
             pairs = dists[iu]
@@ -618,11 +611,16 @@ class ProteinFoldingGUI:
             total_pairs = len(pairs)
             return float(contacts) / total_pairs if total_pairs > 0 else 0.0
 
-        # Build text lines
-        lines = []
-        # If multiple optimizers were run, include a comparison summary table
+        # Header
+        self.results_text.insert(tk.END, "\n")
+        self.results_text.insert(tk.END, " PROTEIN FOLDING SIMULATION RESULTS\n", 'header')
+        self.results_text.insert(tk.END, " " + "="*68 + "\n\n")
+        
+        # If multiple optimizers were run, show comparison
         if getattr(self, 'optimizer_results', None):
-            lines.append("Optimizer comparisons:")
+            self.results_text.insert(tk.END, " OPTIMIZER COMPARISON\n", 'section')
+            self.results_text.insert(tk.END, " " + "-"*68 + "\n\n")
+            
             for res in self.optimizer_results:
                 name = res.get('name')
                 t = res.get('time')
@@ -637,43 +635,86 @@ class ProteinFoldingGUI:
                     if hist:
                         rmsd_val = rmsd(hist[0][0], coords)
                 except Exception:
-                    rmsd_val = None
+                    pass
                 acc = acceptance_rate_from_history(hist)
                 evals_sec = (len(hist) / t) if (t and t > 0) else None
                 contact_frac = contact_fraction(coords) if coords is not None else None
-                lines.append(f"- {name}: time={t:.2f}s, best_energy={be}, energy_per_res={energy_per_res}, Radius_of_Gyration={rg}, RMSD_init={rmsd_val}, acceptance_rate={acc}, evals/s={evals_sec}, contact_frac={contact_frac}")
-            # indicate winner
+                
+                self.results_text.insert(tk.END, f"  {name}\n", 'metric')
+                self.results_text.insert(tk.END, f"    Time:              {t:.2f} s\n")
+                self.results_text.insert(tk.END, f"    Best Energy:       {be:.2f}\n" if be is not None else "    Best Energy:       N/A\n")
+                self.results_text.insert(tk.END, f"    Energy/Residue:    {energy_per_res:.2f}\n" if energy_per_res is not None else "    Energy/Residue:    N/A\n")
+                self.results_text.insert(tk.END, f"    Radius of Gyr.:    {rg:.2f} A\n" if rg is not None else "    Radius of Gyr.:    N/A\n")
+                self.results_text.insert(tk.END, f"    RMSD (initial):    {rmsd_val:.2f} A\n" if rmsd_val is not None else "    RMSD (initial):    N/A\n")
+                self.results_text.insert(tk.END, f"    Acceptance Rate:   {acc:.1%}\n" if acc is not None else "    Acceptance Rate:   N/A\n")
+                self.results_text.insert(tk.END, f"    Evaluations/sec:   {evals_sec:.0f}\n" if evals_sec is not None else "    Evaluations/sec:   N/A\n")
+                self.results_text.insert(tk.END, f"    Contact Fraction:  {contact_frac:.2%}\n\n" if contact_frac is not None else "    Contact Fraction:  N/A\n\n")
+            
+            # Show winner
             try:
                 winner = min(self.optimizer_results, key=lambda r: r.get('best_energy') if r.get('best_energy') is not None else float('inf'))
-                lines.append(f"Winner: {winner.get('name')} (energy={winner.get('best_energy')})\n")
+                self.results_text.insert(tk.END, f"  WINNER: {winner.get('name')} (Energy: {winner.get('best_energy'):.2f})\n\n", 'winner')
             except Exception:
                 pass
-        # include starting temperature used
+        
+        # Simulation parameters
+        self.results_text.insert(tk.END, " SIMULATION PARAMETERS\n", 'section')
+        self.results_text.insert(tk.END, " " + "-"*68 + "\n\n")
+        
         if getattr(self, 'start_temp', None) is not None:
-            lines.append(f"Starting temperature (K): {self.start_temp}\n")
+            self.results_text.insert(tk.END, f"  Starting Temperature (K):        {self.start_temp}\n")
         if getattr(self, 'start_T_energy', None) is not None:
-            lines.append(f"Starting temperature (energy units, k_BT): {self.start_T_energy}\n")
+            self.results_text.insert(tk.END, f"  Temperature (k_BT energy units): {self.start_T_energy:.4f}\n")
+        self.results_text.insert(tk.END, "\n")
 
+        # Energy metrics
+        initial_energy = self.history[0][1].get('total') if isinstance(self.history[0][1], dict) else None
+        energy_breakdown = self.history[0][1] if isinstance(self.history[0][1], dict) else {}
+        best_energy = getattr(self, 'best_energy', None)
+        if best_energy is None:
+            energies = [h[1].get('total') for h in self.history if isinstance(h[1], dict)]
+            best_energy = min(energies) if energies else None
+
+        self.results_text.insert(tk.END, " ENERGY METRICS\n", 'section')
+        self.results_text.insert(tk.END, " " + "-"*68 + "\n\n")
+        
         if initial_energy is not None:
-            lines.append(f"Initial energy: {initial_energy}\n")
+            self.results_text.insert(tk.END, f"  Initial Energy:    {initial_energy:.2f} kcal/mol\n")
         else:
-            lines.append("Initial energy: N/A\n")
-
-        lines.append(f"Energy breakdown: {energy_breakdown}\n")
+            self.results_text.insert(tk.END, "  Initial Energy:    N/A\n")
 
         if best_energy is not None:
-            lines.append(f"Best energy found: {best_energy}\n")
+            self.results_text.insert(tk.END, f"  Best Energy:       ", 'metric')
+            self.results_text.insert(tk.END, f"{best_energy:.2f} kcal/mol\n", 'value')
+            if initial_energy is not None:
+                improvement = initial_energy - best_energy
+                self.results_text.insert(tk.END, f"  Energy Reduction:  {improvement:.2f} kcal/mol\n")
         else:
-            lines.append("Best energy found: N/A\n")
+            self.results_text.insert(tk.END, "  Best Energy:       N/A\n")
+        
+        self.results_text.insert(tk.END, "\n  Energy Components:\n")
+        if energy_breakdown:
+            # Filter out inactive/misleading terms
+            excluded_terms = {'hydro', 'ss', 'hbond'}
+            for key, value in energy_breakdown.items():
+                if key != 'total' and key not in excluded_terms:
+                    self.results_text.insert(tk.END, f"    {key:12s}: {value:8.2f}\n")
+        self.results_text.insert(tk.END, "\n")
 
-        if rmsd is not None:
-            lines.append(f"RMSD to initial structure: {rmsd}\n")
-        else:
-            lines.append("RMSD to initial structure: N/A\n")
-
-        # Insert into scrolled text
-        self.results_text.delete('1.0', tk.END)
-        self.results_text.insert(tk.END, "\n".join(lines))
+        # Structural metrics
+        self.results_text.insert(tk.END, " STRUCTURAL METRICS\n", 'section')
+        self.results_text.insert(tk.END, " " + "-"*68 + "\n\n")
+        
+        try:
+            initial_coords = self.history[0][0]
+            target_coords = getattr(self, 'best_coords', self.history[-1][0])
+            diff = target_coords - initial_coords
+            rmsd_val = np.sqrt(np.mean(np.sum(diff**2, axis=1)))
+            self.results_text.insert(tk.END, f"  RMSD from Initial:  {rmsd_val:.2f} A\n")
+        except Exception:
+            self.results_text.insert(tk.END, "  RMSD from Initial:  N/A\n")
+        
+        self.results_text.insert(tk.END, "\n" + " " + "="*68 + "\n")
         
     def compare_alphafold(self):
         """Compare current structure with AlphaFold"""
@@ -692,20 +733,29 @@ class ProteinFoldingGUI:
         af_result = compare_with_alphafold(protein)
         
         if af_result:
-            self.results_text.insert(tk.END, "\n=== AlphaFold Comparison ===\n")
-            self.results_text.insert(tk.END, f"UniProt ID: {af_result['uniprot_id']}\n")
-            self.results_text.insert(tk.END, f"RMSD: {af_result['rmsd']:.2f} Å\n")
-            self.results_text.insert(tk.END, f"GDT-TS Score: {af_result['gdt_ts']:.1f}%\n")
+            self.results_text.insert(tk.END, "\n")
+            self.results_text.insert(tk.END, "─" * 70 + "\n")
+            self.results_text.insert(tk.END, "  ALPHAFOLD VALIDATION\n")
+            self.results_text.insert(tk.END, "─" * 70 + "\n")
+            self.results_text.insert(tk.END, "\n")
+            self.results_text.insert(tk.END, f"  Reference Structure\n")
+            self.results_text.insert(tk.END, f"  ├─ UniProt ID:          {af_result['uniprot_id']}\n")
+            self.results_text.insert(tk.END, f"  ├─ AlphaFold Length:    {af_result.get('alphafold_length', 'N/A')} residues\n")
+            self.results_text.insert(tk.END, f"  └─ Simulated Length:    {af_result.get('simulated_length', 'N/A')} residues\n")
+            self.results_text.insert(tk.END, "\n")
+            
+            self.results_text.insert(tk.END, f"  Accuracy Metrics\n")
+            self.results_text.insert(tk.END, f"  ├─ RMSD:                {af_result['rmsd']:.2f} Å\n")
+            self.results_text.insert(tk.END, f"  ├─ GDT-TS Score:        {af_result['gdt_ts']:.1f}%\n")
             
             # Display new enhanced metrics if available
             if 'tm_score' in af_result:
-                self.results_text.insert(tk.END, f"TM-Score: {af_result['tm_score']:.3f}\n")
+                self.results_text.insert(tk.END, f"  ├─ TM-Score:            {af_result['tm_score']:.3f}\n")
             if 'local_accuracy' in af_result:
-                self.results_text.insert(tk.END, f"Local Accuracy: {af_result['local_accuracy']:.1%}\n")
-            if 'accuracy_score' in af_result:
-                self.results_text.insert(tk.END, f"Overall Accuracy Score: {af_result['accuracy_score']:.1f}%\n")
+                self.results_text.insert(tk.END, f"  ├─ Local Accuracy:      {af_result['local_accuracy']:.1%}\n")
             
-            self.results_text.insert(tk.END, f"Coverage: {af_result['coverage']:.1f}%\n")
+            self.results_text.insert(tk.END, f"  └─ Coverage:            {af_result['coverage']:.1%}\n")
+            self.results_text.insert(tk.END, "\n")
             
             # Enhanced accuracy assessment using multiple metrics
             rmsd = af_result['rmsd']
@@ -713,20 +763,33 @@ class ProteinFoldingGUI:
             tm_score = af_result.get('tm_score', 0)
             
             if rmsd < 3.0 and gdt_ts > 80 and tm_score > 0.7:
-                accuracy = "Excellent (Near-native)"
+                accuracy = "★★★ Excellent (Near-native)"
+                symbol = "✓"
             elif rmsd < 5.0 and gdt_ts > 60 and tm_score > 0.5:
-                accuracy = "Very Good"
+                accuracy = "★★ Very Good"
+                symbol = "✓"
             elif rmsd < 8.0 and gdt_ts > 40 and tm_score > 0.3:
-                accuracy = "Good"
+                accuracy = "★ Good"
+                symbol = "○"
             elif rmsd < 12.0 and gdt_ts > 25:
                 accuracy = "Fair"
+                symbol = "○"
             else:
                 accuracy = "Poor"
+                symbol = "✗"
             
-            self.results_text.insert(tk.END, f"Structural Accuracy: {accuracy}\n")
+            self.results_text.insert(tk.END, f"  {symbol} Quality Assessment: {accuracy}\n")
+            self.results_text.insert(tk.END, "\n")
+            self.results_text.insert(tk.END, "=" * 70 + "\n")
         else:
-            self.results_text.insert(tk.END, "\n=== AlphaFold Comparison ===\n")
-            self.results_text.insert(tk.END, "No matching AlphaFold structure found\n")
+            self.results_text.insert(tk.END, "\n")
+            self.results_text.insert(tk.END, "─" * 70 + "\n")
+            self.results_text.insert(tk.END, "  ALPHAFOLD VALIDATION\n")
+            self.results_text.insert(tk.END, "─" * 70 + "\n")
+            self.results_text.insert(tk.END, "\n")
+            self.results_text.insert(tk.END, "  ✗ No matching AlphaFold structure found\n")
+            self.results_text.insert(tk.END, "\n")
+            self.results_text.insert(tk.END, "=" * 70 + "\n")
         
         self.results_text.see(tk.END)
         
@@ -943,7 +1006,7 @@ class ProteinFoldingGUI:
     def plot_structs_matrix(self, optimizer_results):
         """Compute contact/distance maps for each optimizer's best structure and display side-by-side.
 
-        Shows pairwise CA-CA distances for each optimizer as separate contact maps.
+        Shows pairwise CA-CA distances for each optimizer as separate contact maps in a 2x2 grid.
         """
         try:
             self.ax_matrix.clear()
@@ -960,17 +1023,17 @@ class ProteinFoldingGUI:
             self.ax_matrix.clear()
             self.fig_matrix.clear()
             
-            # Create grid of subplots (1 row, m columns for up to m optimizers)
-            n_cols = min(m, 3)  # max 3 columns to keep readable
-            n_rows = (m + n_cols - 1) // n_cols
+            # Create 2x2 grid of subplots for up to 4 optimizers
+            n_cols = 2
+            n_rows = 2
             
             axes = []
-            for idx in range(m):
+            for idx in range(min(m, 4)):  # max 4 optimizers in 2x2 grid
                 ax = self.fig_matrix.add_subplot(n_rows, n_cols, idx + 1)
                 axes.append(ax)
             
-            # Compute and plot contact map for each optimizer
-            for idx, (coords, name) in enumerate(zip(coords_list, names)):
+            # Compute and plot contact map for each optimizer (up to 4 in 2x2 grid)
+            for idx, (coords, name) in enumerate(zip(coords_list[:4], names[:4])):
                 if coords.size == 0:
                     continue
                     
@@ -984,16 +1047,16 @@ class ProteinFoldingGUI:
                 # Plot contact map (distance matrix)
                 ax = axes[idx]
                 im = ax.imshow(dist_mat, cmap='viridis_r', interpolation='nearest', vmin=0, vmax=30)
-                ax.set_title(f'{name}\n(Residue Distances)', fontsize=10)
-                ax.set_xlabel('Residue Index', fontsize=8)
-                ax.set_ylabel('Residue Index', fontsize=8)
-                ax.tick_params(labelsize=7)
+                ax.set_title(f'{name}\n(Residue Distances)', fontsize=9)
+                ax.set_xlabel('Residue Index', fontsize=7)
+                ax.set_ylabel('Residue Index', fontsize=7)
+                ax.tick_params(labelsize=6)
                 
                 # Add colorbar for each subplot
                 try:
                     cbar = self.fig_matrix.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                    cbar.set_label('Distance (Å)', fontsize=8)
-                    cbar.ax.tick_params(labelsize=7)
+                    cbar.set_label('Distance (Å)', fontsize=7)
+                    cbar.ax.tick_params(labelsize=6)
                 except Exception:
                     pass
             

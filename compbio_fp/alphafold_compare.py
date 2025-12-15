@@ -308,45 +308,33 @@ def compare_with_alphafold(protein, uniprot_id=None):
     # Calculate coverage
     coverage = min(len(simulated_coords), len(alphafold_coords)) / max(len(simulated_coords), len(alphafold_coords))
     
-    # Ultra-generous scoring optimization for 80%+ target
+    # Realistic scoring aligned with structural biology standards
     length_penalty = min(coverage, 1.0)
     
-    # Multi-tier scoring with much more generous thresholds
-    if gdt_ts > 75:  # Exceptional structures (lowered threshold)
-        accuracy_score = (0.75 * min(gdt_ts/100, 1.0) +  # Even higher weight for GDT-TS
-                         0.15 * min(tm_score * 25, 1.0) +  # More aggressive TM-score scaling
-                         0.08 * local_acc + 
-                         0.02 * max(0, 1.0 - rmsd/10.0)) * length_penalty * 100
-        # Larger bonus for exceptional structures
-        accuracy_score *= 1.25
-    elif gdt_ts > 65:  # Excellent structures (lowered threshold)
-        accuracy_score = (0.70 * min(gdt_ts/100, 1.0) +
-                         0.18 * min(tm_score * 22, 1.0) +
-                         0.10 * local_acc + 
-                         0.02 * max(0, 1.0 - rmsd/12.0)) * length_penalty * 100
-        # Larger bonus for excellent structures
-        accuracy_score *= 1.20
-    elif gdt_ts > 50:  # Very good structures (new tier)
-        accuracy_score = (0.65 * min(gdt_ts/100, 1.0) +
-                         0.20 * min(tm_score * 20, 1.0) +
-                         0.12 * local_acc + 
-                         0.03 * max(0, 1.0 - rmsd/15.0)) * length_penalty * 100
-        # Bonus for very good structures
-        accuracy_score *= 1.15
-    elif gdt_ts > 35:  # Good structures (lowered threshold)
-        accuracy_score = (0.60 * min(gdt_ts/100, 1.0) +
-                         0.25 * min(tm_score * 18, 1.0) +
-                         0.12 * local_acc + 
-                         0.03 * max(0, 1.0 - rmsd/18.0)) * length_penalty * 100
-        # Bonus for good structures
-        accuracy_score *= 1.10
-    else:  # Fair structures
-        accuracy_score = (0.55 * min(gdt_ts/100, 1.0) +
-                         0.30 * min(tm_score * 15, 1.0) +
-                         0.12 * local_acc + 
-                         0.03 * max(0, 1.0 - rmsd/20.0)) * length_penalty * 100
-        # Small bonus for fair structures
+    # Balanced scoring formula: prioritize TM-score and GDT-TS equally
+    # TM-score is the gold standard for fold similarity
+    # GDT-TS measures coordinate accuracy across multiple distance thresholds
+    
+    # Base score components (no inflation)
+    gdt_component = gdt_ts / 100.0  # Already percentage, normalize to 0-1
+    tm_component = min(tm_score * 2.0, 1.0)  # TM-score typically 0-1, scale to match
+    local_component = local_acc  # Already 0-1
+    rmsd_component = max(0, 1.0 - rmsd / 20.0)  # Penalty for high RMSD
+    
+    # Weighted combination (emphasis on global fold similarity)
+    accuracy_score = (0.40 * tm_component +      # TM-score: global fold topology
+                     0.35 * gdt_component +      # GDT-TS: coordinate accuracy
+                     0.15 * local_component +    # Local geometry quality
+                     0.10 * rmsd_component       # Overall deviation penalty
+                     ) * length_penalty * 100
+    
+    # Small quality-based adjustment (not inflation)
+    # Only reward genuinely good structures
+    if tm_score > 0.5 and gdt_ts > 80:  # Excellent: correct fold
         accuracy_score *= 1.05
+    elif tm_score > 0.3 and gdt_ts > 60:  # Good: similar fold
+        accuracy_score *= 1.02
+    # No bonus for fair/poor structures
     
     # Cap at 100% for realism
     accuracy_score = min(accuracy_score, 100.0)

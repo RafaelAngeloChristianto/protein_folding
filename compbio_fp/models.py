@@ -86,4 +86,63 @@ class Protein:
         return np.sqrt(np.mean(np.sum(diff**2, axis=1)))
 
 
-__all__ = ['Protein', 'AMINO_PROPS', 'distance', 'angle_between']
+def initialize_extended_chain(sequence_length, ca_distance=3.8):
+    """Initialize protein coordinates in an extended beta-strand conformation.
+    
+    This provides a better starting structure than random coordinates,
+    placing all CA atoms along a straight line with proper spacing.
+    
+    Args:
+        sequence_length: Number of residues
+        ca_distance: Distance between consecutive CA atoms (default 3.8 Å)
+    
+    Returns:
+        coords: Array of shape (sequence_length, 3) with extended chain coordinates
+    """
+    coords = np.zeros((sequence_length, 3))
+    for i in range(sequence_length):
+        coords[i] = [i * ca_distance, 0, 0]  # Extended along x-axis
+    return coords
+
+
+def initialize_helical_chain(sequence_length, ca_distance=3.8):
+    """Initialize protein coordinates in an alpha-helix conformation.
+    
+    Places CA atoms in an ideal alpha-helix geometry:
+    - 3.6 residues per turn
+    - 5.4 Å pitch (rise per turn)
+    - 2.3 Å radius
+    
+    Args:
+        sequence_length: Number of residues
+        ca_distance: Average CA-CA distance (adjusted for helix, ~3.8 Å)
+    
+    Returns:
+        coords: Array of shape (sequence_length, 3) with helical coordinates
+    """
+    coords = np.zeros((sequence_length, 3))
+    
+    # Alpha helix parameters
+    residues_per_turn = 3.6
+    pitch = 5.4  # Angstroms per turn (rise along helix axis)
+    radius = 2.3  # Angstroms
+    
+    for i in range(sequence_length):
+        # Angle around helix axis
+        theta = (i / residues_per_turn) * 2 * np.pi
+        
+        # Position along helix axis
+        z = (i / residues_per_turn) * pitch
+        
+        # Coordinates in cylindrical system, then convert to Cartesian
+        coords[i] = [
+            radius * np.cos(theta),  # x
+            radius * np.sin(theta),  # y
+            z                         # z (helix axis)
+        ]
+    
+    return coords
+
+
+__all__ = ['Protein', 'AMINO_PROPS', 'distance', 'angle_between', 
+           'initialize_extended_chain', 'initialize_helical_chain']
